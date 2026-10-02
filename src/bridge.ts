@@ -188,7 +188,6 @@ export function createBridge(
           render: (scene, vars) => renderCopy(scene, vars, config.texts),
           intervalMs: config.streaming.intervalMs,
           chunkSize: config.streaming.chunkSize,
-          maxScenes: config.streaming.maxScenes,
           proactive: config.streaming.proactive,
         })
       : null

@@ -82,7 +82,6 @@ function baseOpts(
     render: (scene, vars) => renderCopy(scene, vars),
     intervalMs: 1500,
     chunkSize: 500,
-    maxScenes: 3,
     fetchImpl,
     now,
     ...over,
@@ -147,34 +146,7 @@ describe("StreamSession.start", () => {
 })
 
 describe("StreamSession.switchScene", () => {
-  test("旧流收到 state10 终片，新流 index 重置 0 且首片为场景文案", async () => {
-    const { calls, fetchImpl } = makeRecorder()
-    const s = track(new StreamSession(baseOpts(fetchImpl, autoClock(1500))))
-    await s.start()
-    await s.switchScene("TOOL_CALL", { tool: "bash" })
-    const list = shards(calls)
-    expect(list).toHaveLength(3)
-    // 旧流终片：官方 close 形状 = replace + 该流最后成功内容 + state10（真机 404 修复）
-    expect(list[1]).toMatchObject({
-      content_raw: "请稍候",
-      index: 1,
-      input_mode: "replace",
-      input_state: 10,
-      stream_msg_id: "id-1",
-    })
-    // 新流首片
-    expect(list[2]).toMatchObject({
-      content_raw: "🔧 调用工具：bash",
-      index: 0,
-      input_mode: "replace",
-      input_state: 1,
-      msg_id: "MID1",
-    })
-    expectMsgSeqConstantPerStream(list)
-    expect(s.state).toBe("streaming")
-  })
-
-  test("占位流预算用尽（含 WAITING ≥ maxScenes）时改走主动消息", async () => {
+  test("场景切换零开流：走主动消息（/messages 端点、无 msg_id），占位流保持原样", async () => {
     const { calls, fetchImpl } = makeRecorder()
     const proactive: Recorded[] = []
     globalThis.fetch = (async (url: unknown, init?: RequestInit) => {
@@ -182,12 +154,14 @@ describe("StreamSession.switchScene", () => {
       proactive.push({ url: String(url), headers: {}, body })
       return new Response(JSON.stringify({ id: "p1", timestamp: 1 }), { status: 200 })
     }) as typeof fetch
-    const s = track(new StreamSession(baseOpts(fetchImpl, autoClock(1500), { maxScenes: 1 })))
-    await s.start() // WAITING，占位流 1/1
+    const s = track(new StreamSession(baseOpts(fetchImpl, autoClock(1500))))
+    await s.start()
     await s.switchScene("TOOL_CALL", { tool: "bash" })
-    // 无新增 stream 分片
-    expect(shards(calls)).toHaveLength(1)
-    // 走 /v2/users/{openid}/messages 主动消息（非 stream_messages）
+    // 零开流：流式分片仍只有 WAITING 首片（不关旧流、不另起场景流）
+    const list = shards(calls)
+    expect(list).toHaveLength(1)
+    expect(list[0].content_raw).toBe("请稍候")
+    // 场景文案走 /v2/users/{openid}/messages 主动消息（非 stream_messages），不带 msg_id
     expect(proactive).toHaveLength(1)
     expect(proactive[0].url).toBe("https://api.sgroup.qq.com/v2/users/U1/messages")
     expect(proactive[0].body.msg_id).toBeUndefined()
@@ -246,7 +220,7 @@ describe("StreamSession.switchScene", () => {
   })
 })
 
-// ---- 开流预算（占位+正文合并核算，MAX_STREAM_OPENS = 4 - 1 = 3） --------------------------
+// ---- 开流预算（占位+正文合并核算，MAX_STREAM_OPENS = 4 - 1 = 3；场景消息零开流消耗） --------
 
 describe("StreamSession 开流预算", () => {
   test("[MAJOR] 连续多段 TEXT 重置：开流总数 ≤ 预算，超预算后无 msg_id 新流首片，finish false 且兜底可走", async () => {
@@ -265,7 +239,8 @@ describe("StreamSession 开流预算", () => {
       await s.switchScene("TEXT", { snippet: "x" })
     }
     const list = okShards(calls)
-    // 开流总数 = WAITING + 预算内 2 段正文 = 3 ≤ MAX_STREAM_OPENS（被动 4 次预留 1 次兜底）
+    // 开流总数 = 占位① + 正文② + 重置③ = 3 ≤ MAX_STREAM_OPENS（被动 4 次预留 1 次兜底；
+    // 场景消息一律走主动消息，零开流消耗）
     // 每片都带 msg_id，开流以 index0 识别
     const opens = list.filter((x) => x.index === 0)
     expect(opens).toHaveLength(3)

@@ -25,7 +25,6 @@ export interface StreamingConfig {
   proactive: boolean // STREAMING_PROACTIVE，默认 off（开流走主动消息通道：不带 msg_id，不占被动回复预算；主动模式当前被 QQ 服务端拒绝 50015001，待官方放开后可切回 on）
   intervalMs: number // STREAMING_INTERVAL_MS，默认 500（对齐官方 SDK DEFAULT_THROTTLE_MS；任意两次 HTTP 发送最小间隔）
   chunkSize: number // STREAMING_CHUNK_SIZE，默认 500（正文单片最大字符数）
-  maxScenes: number // STREAMING_MAX_SCENES，默认 3（占位流条数上限：占位流+正文流共享被动回复 4 次预算）
 }
 
 export interface Config {
@@ -111,7 +110,6 @@ export async function ensureConfig(): Promise<void> {
     `# STREAMING_PROACTIVE=off`,
     `# STREAMING_INTERVAL_MS=500`,
     `# STREAMING_CHUNK_SIZE=500`,
-    `# STREAMING_MAX_SCENES=3`,
     `# PROGRESS_TOOL_CALL=on`,
     `# TEXT_WAITING=请稍候{dots}`,
     `# TEXT_TOOL_CALL=🔧 调用工具：{tool}`,
@@ -186,7 +184,6 @@ export function loadConfig(): Config {
       proactive: (process.env.STREAMING_PROACTIVE ?? "off").toLowerCase() === "on",
       intervalMs: parseInt(process.env.STREAMING_INTERVAL_MS ?? "500", 10),
       chunkSize: parseInt(process.env.STREAMING_CHUNK_SIZE ?? "500", 10),
-      maxScenes: parseInt(process.env.STREAMING_MAX_SCENES ?? "3", 10),
     },
     progress: {
       enabled: (process.env.PROGRESS ?? "on").toLowerCase() !== "off",

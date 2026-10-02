@@ -73,7 +73,7 @@ function makeConfig(
     opencode: { baseUrl: "", externalUrl: false },
     allowedUsers: [],
     maxReplyLength: 3000,
-    streaming: { enabled: false, intervalMs: 1500, chunkSize: 500, maxScenes: 3, ...over.streaming },
+    streaming: { enabled: false, intervalMs: 1500, chunkSize: 500, ...over.streaming },
     progress: {
       enabled: true,
       max: 0,

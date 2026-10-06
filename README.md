@@ -275,7 +275,7 @@ systemctl --user enable --now openqq.service
 
 ```
 POST /v2/{users|groups}/{id}/upload_prepare     # file_type/file_size(str)/file_name/md5/sha1/md5_10m
-   ↓ 返回 upload_id、block_size（默认 5MB）、parts[]{index 从 0 起, presigned_url, block_size}
+   ↓ 返回 upload_id、block_size（实测 10485760=10MB，文档称默认 5MB）、parts[]{index（实测单分片返回 1，文档称从 0 起）, presigned_url, block_size} —— 实现一律以响应为准，不自行编号
 HTTP PUT  presigned_url   × N                   # 直传对象存储：不带 Authorization，也不过 api 网关（所以不会 413）
 POST /v2/{users|groups}/{id}/upload_part_finish # upload_id/part_index/block_size(str)/md5(本片)，逐片登记
 POST /v2/{users|groups}/{id}/files              # 带 upload_id 即触发**服务端合并** → file_info

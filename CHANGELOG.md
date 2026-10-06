@@ -47,7 +47,9 @@
 
 - `bun test` → `158 pass / 0 fail / 526 expect()`（5 个文件）。
 - `npx tsc --noEmit` → 退出码 0。
-- **端到端未验证**：本环境无真实 QQ 发送凭据，>4MB 文件的真发验收需上线后人工执行一次，
-  并在收件人侧确认收到的是**单个文件**。
+- **端到端已验证（2026-10-06）**：真实 token 发送 6MB（6291456 字节）文件，收件人确认收到**单个**完整文件；
+  日志 `upload_prepare 200 → PUT 6291456 bytes 200 → upload_part_finish 200 → /files(upload_id) 200 → messages 200`。
+  实测平台返回 `block_size=10485760`（10MB）且 `parts[].index=1`，与文档所称「默认 5MB / 从 0 起」不符，
+  实现因一律以响应为准而不受影响；`>1` 分片的真实循环仍只有契约级单测（需发 >10MB 文件才会走到）。
 
 [Unreleased]: https://github.com/（本地仓库，暂无远端）

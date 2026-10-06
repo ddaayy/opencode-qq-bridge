@@ -158,7 +158,7 @@ Bun >= 1.0；`ws`（QQ Gateway）。已移除 `@opencode-ai/sdk` 依赖。
   - `upload_prepare`（`file_type`/`file_size` 是 **string**/`file_name`/整文件 `md5`/`sha1`/`md5_10m`
     = 前 10002432 字节的 MD5，三个哈希**一次流式**产出，1MB 步进，200MB 文件也不进内存两遍）；
   - 逐片 `HTTP PUT presigned_url`（**不带 Authorization**，不过网关），再 `upload_part_finish`
-    （`upload_id`/`part_index`（index 从 0 起）/`block_size`(str)/本片 `md5`）；
+    （`upload_id`/`part_index`（**沿用响应 `parts[].index`**：文档写从 0 起、实测单分片返回 1）/`block_size`(str)/本片 `md5`）；
   - `POST /files` 带 `upload_id` 触发**服务端合并** → `file_info` → 只发一条 `msg_type=7` 消息。
   - **收件人收到单个完整文件**：没有 `.001/.002` 多片，也不再有 `cat … > …` 合并命令文案
     （`sendFileToQQ` 在该模式下返回 `undefined`）。
@@ -181,9 +181,19 @@ Bun >= 1.0；`ws`（QQ Gateway）。已移除 `@opencode-ai/sdk` 依赖。
   保留 `HTTP 413 Request Entity Too Large` 与前 300 字符原文，不再退化成
   `Failed to parse response` 把根因藏掉。`putPresigned()` 对非 JSON 错误体（如对象存储 XML）同理。
 
-**未在本环境端到端验证**：真实分片流程需要可用真实 token 打通到发送路径，本机只有契约级单测
-（替换 `globalThis.fetch` 记录 prepare/PUT/part_finish/合并的调用序列与请求体）。
-上线后需人工发一次 >4MB 文件验收（收件人侧确认只收到一个文件）。
+**端到端已验证（2026-10-06，真实 token）**：发送 6MB（6291456 字节）本地文件，收件人确认收到**单个**完整文件。
+日志链路 `15:56:42 upload_prepare 200 → PUT 6291456 bytes 200 → upload_part_finish 200 →
+POST /files(upload_id) 200 → messages 200`，桥日志 `[sender] 分片上传完成 … parts=1 → 服务端合并为 1 个文件`。
+同一轮还证实：预签名 URL 在日志里被脱敏成 `part_1?<已省略>`，而实际 `PUT` 仍用完整带签名 URL（否则不会 200）。
+
+**实测与文档的两处出入**（实现按「信响应、不假设」处理，因此**不需要改代码**）：
+
+- 平台实际返回 `block_size = "10485760"`（**10MB**，非文档所称默认 5MB）→ 6MB 文件只出 **1 个分片**。
+- 平台返回的 `parts[].index` 是 **1**（文档写「从 0 起」）。实现直接沿用响应里的 `index` 与 `presigned_url`、
+  不自行编号，故不受影响；`upload_part_finish` 回传同一 `part_index` 得 200。
+
+**尚未实测**：`>1` 分片的真实循环（多片 PUT + 800ms 节流 + 逐片 finish）目前只有契约级单测
+（替换 `globalThis.fetch` 记录调用序列与请求体），真实环境需发一个 **>10MB** 文件才会走到。
 
 **已知替代通道**：`[[sendfile:https://…]]` 走平台 URL 上传，由腾讯侧下载，**不受内联 body 上限**。
 本机为 NAT 内网（无公网入站），可用 Tailscale Funnel 临时把本地文件暴露成公网 https URL

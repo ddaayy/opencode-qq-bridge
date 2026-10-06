@@ -1,5 +1,5 @@
 // @input:  (none - raw HTTP to QQ Bot REST API)
-// @output: getAccessToken, apiRequest, QQApiError, sendStreamMessage, classifyStreamError, sendC2CMessage, sendGroupMessage, getGatewayUrl, startBackgroundTokenRefresh
+// @output: getAccessToken, apiRequest, QQApiError, sendStreamMessage, classifyStreamError, sendC2CMessage, sendGroupMessage, getGatewayUrl, startBackgroundTokenRefresh, uploadC2CFile/uploadGroupFile, uploadPrepareC2C/uploadPrepareGroup, uploadPartFinishC2C/uploadPartFinishGroup, putPresigned
 // @pos:    qq层 - QQ Bot REST API 鉴权+请求封装 (Token singleflight + 后台刷新)
 
 const API_BASE = "https://api.sgroup.qq.com"
@@ -227,7 +227,7 @@ export async function apiRequest<T = unknown>(
   let rawBody = ""
   try {
     rawBody = await res.text()
-    console.log("[qqbot-api] <<< Body:", rawBody)
+    console.log("[qqbot-api] <<< Body:", sanitizeResponseBodyLog(rawBody))
     data = JSON.parse(rawBody) as T
   } catch (err) {
     // 非 JSON 错误体（如网关 413 的 HTML）：保留状态码与原文，别退化成 "parse failed" 把根因藏掉
@@ -422,6 +422,8 @@ export interface MediaUploadOptions {
   fileData?: string
   url?: string
   fileName?: string
+  /** 官方分片上传的合并凭据：传入即走「服务端合并」路径（url 可为空） */
+  uploadId?: string
 }
 
 export interface MediaUploadResponse {
@@ -439,6 +441,7 @@ async function uploadFile(
   if (options.fileName) body.file_name = options.fileName
   if (options.url) body.url = options.url
   if (options.fileData) body.file_data = options.fileData
+  if (options.uploadId) body.upload_id = options.uploadId
   const data = await apiRequest<MediaUploadResponse>(accessToken, "POST", path, body)
   if (!data.file_info) {
     throw new Error(`文件上传失败: ${JSON.stringify(data)}`)
@@ -454,6 +457,239 @@ export function uploadC2CFile(accessToken: string, openid: string, options: Medi
 /** 上传富媒体文件（群聊），返回 file_info */
 export function uploadGroupFile(accessToken: string, groupOpenid: string, options: MediaUploadOptions): Promise<string> {
   return uploadFile(accessToken, `/v2/groups/${groupOpenid}/files`, options)
+}
+
+// ---------------------------------------------------------------------------
+// 官方分片上传（大文件通道，2026-09 文档「推荐使用分片上传」）
+//
+// 三步：upload_prepare 换预签名 URL → 逐片 PUT 直传对象存储 → upload_part_finish 登记 →
+// POST /files 传 upload_id 让服务端合并。合并后收件人收到**一个**文件，不产生 .001/.002 多片，
+// 也不像 base64 内联那样被 api 网关 413（分片 PUT 不过网关）。
+// 场景隔离：单聊与群聊的上传/预上传端点互相独立，预上传、分片、合并必须同场景。
+// ---------------------------------------------------------------------------
+
+/** 预签名分片描述（官方契约：index 从 0 起；block_size 是**字节数字的字符串**） */
+export interface UploadPreparePart {
+  index: number
+  presigned_url: string
+  block_size: string
+}
+
+export interface UploadPrepareResponse {
+  upload_id: string
+  block_size: string
+  parts: UploadPreparePart[]
+  /** 默认 concurrency=1（串行）、retry_timeout=300s、retry_delay=1s；本实现按串行 + 调用方节流 */
+  upload_config?: {
+    concurrency?: number
+    retry_timeout?: number
+    retry_delay?: number
+  }
+}
+
+/** upload_prepare 请求体（官方契约：file_size 是 string，不是 number） */
+export interface PrepareOptions {
+  fileType: number
+  fileSize: string
+  fileName: string
+  /** 整文件 MD5 */
+  md5: string
+  /** 整文件 SHA1 */
+  sha1: string
+  /** 前 10002432 字节的 MD5（官方 md5_10m 口径） */
+  md5_10m: string
+}
+
+/** upload_part_finish 请求体（md5 为**该分片**内容的 MD5） */
+export interface PartFinishOptions {
+  uploadId: string
+  partIndex: number
+  blockSize: string
+  md5: string
+}
+
+function buildPrepareBody(options: PrepareOptions): Record<string, unknown> {
+  return {
+    file_type: options.fileType,
+    file_size: String(options.fileSize),
+    file_name: options.fileName,
+    md5: options.md5,
+    sha1: options.sha1,
+    md5_10m: options.md5_10m,
+  }
+}
+
+async function uploadPrepare(
+  accessToken: string,
+  path: string,
+  options: PrepareOptions,
+): Promise<UploadPrepareResponse> {
+  const data = await apiRequest<UploadPrepareResponse>(accessToken, "POST", path, buildPrepareBody(options))
+  if (!data.upload_id) {
+    throw new Error(`upload_prepare 未返回 upload_id: ${JSON.stringify(data)}`)
+  }
+  return data
+}
+
+/** 预上传分片（C2C）：POST /v2/users/{openid}/upload_prepare，限 10 QPS */
+export function uploadPrepareC2C(
+  accessToken: string,
+  openid: string,
+  options: PrepareOptions,
+): Promise<UploadPrepareResponse> {
+  return uploadPrepare(accessToken, `/v2/users/${openid}/upload_prepare`, options)
+}
+
+/** 预上传分片（群聊）：POST /v2/groups/{group_openid}/upload_prepare，限 10 QPS */
+export function uploadPrepareGroup(
+  accessToken: string,
+  groupOpenid: string,
+  options: PrepareOptions,
+): Promise<UploadPrepareResponse> {
+  return uploadPrepare(accessToken, `/v2/groups/${groupOpenid}/upload_prepare`, options)
+}
+
+async function uploadPartFinish(
+  accessToken: string,
+  path: string,
+  options: PartFinishOptions,
+): Promise<void> {
+  await apiRequest(accessToken, "POST", path, {
+    upload_id: options.uploadId,
+    part_index: options.partIndex,
+    block_size: String(options.blockSize),
+    md5: options.md5,
+  })
+}
+
+/** 登记单个分片已上传（C2C）：POST /v2/users/{openid}/upload_part_finish，限 10 QPS */
+export function uploadPartFinishC2C(accessToken: string, openid: string, options: PartFinishOptions): Promise<void> {
+  return uploadPartFinish(accessToken, `/v2/users/${openid}/upload_part_finish`, options)
+}
+
+/** 登记单个分片已上传（群聊）：POST /v2/groups/{group_openid}/upload_part_finish，限 10 QPS */
+export function uploadPartFinishGroup(
+  accessToken: string,
+  groupOpenid: string,
+  options: PartFinishOptions,
+): Promise<void> {
+  return uploadPartFinish(accessToken, `/v2/groups/${groupOpenid}/upload_part_finish`, options)
+}
+
+/** 官方「文件上传失败，请重试」：大文件分片上传中 BDH 通道异常，属于可重试 */
+const RETRYABLE_UPLOAD_CODE = 40093001
+/** 分片直传的宽松超时（单片默认 5MB，慢网络也要留余量） */
+const PRESIGNED_UPLOAD_TIMEOUT = 120000
+const PRESIGNED_RETRY_ATTEMPTS = 3
+
+/**
+ * 预签名 URL 的展示净化：只保留 pathname，丢弃 query/fragment（签名在 query 里，TTL 内等于
+ * 「可重复 PUT 该分片」的能力令牌，不得写进错误与日志）；pathname 保留分片标识，仍能看出是哪一片。
+ * 仅用于展示/日志，实际请求仍用完整 URL。
+ */
+export function sanitizePresignedUrl(url: string): string {
+  try {
+    const u = new URL(url)
+    return u.pathname + (u.search || u.hash ? "?<已省略>" : "")
+  } catch {
+    return url
+  }
+}
+
+/**
+ * 响应体日志净化：递归把 presigned_url 字段替换为 sanitizePresignedUrl 的展示值
+ * （保留 pathname 与 upload_id/block_size/parts 等排障字段，丢弃 query 里的签名）。
+ * 仅作用于日志字符串，绝不改动返回给调用方的 data。
+ */
+export function sanitizeResponseBodyLog(raw: string): string {
+  let parsed: unknown
+  try {
+    parsed = JSON.parse(raw)
+  } catch {
+    return raw // 非 JSON 体（如网关 HTML）：原样展示，签名不会出现在这类响应里
+  }
+  return JSON.stringify(sanitizeLogBody(parsed))
+}
+
+function sanitizeLogBody(value: unknown): unknown {
+  if (Array.isArray(value)) {
+    return value.map(sanitizeLogBody)
+  }
+  if (value !== null && typeof value === "object") {
+    const out: Record<string, unknown> = {}
+    for (const [key, val] of Object.entries(value as Record<string, unknown>)) {
+      out[key] = key === "presigned_url" && typeof val === "string" ? sanitizePresignedUrl(val) : sanitizeLogBody(val)
+    }
+    return out
+  }
+  return value
+}
+
+/**
+ * 直连预签名 URL 的分片 PUT：**不带 Authorization**（签名在 URL 里），也不走 apiRequest
+ * （既不过 api 网关 → 不再撞 413，也不限 10 QPS 的预上传端点）。
+ * 仅对网络错误 / 429 / 5xx / 40093001 重试（退避 1s、2s）；其它 4xx（含 850031、40093002）直接抛。
+ */
+export async function putPresigned(url: string, data: Buffer): Promise<void> {
+  let lastError: unknown
+  for (let attempt = 1; attempt <= PRESIGNED_RETRY_ATTEMPTS; attempt++) {
+    try {
+      await putPresignedOnce(url, data)
+      return
+    } catch (error) {
+      lastError = error
+      const status = error instanceof QQApiError ? error.status : 0
+      const code = error instanceof QQApiError ? error.code : undefined
+      const retryable = status === 0 || status === 429 || status >= 500 || code === RETRYABLE_UPLOAD_CODE
+      if (!retryable || attempt === PRESIGNED_RETRY_ATTEMPTS) break
+      console.warn(
+        `[qqbot-api] 分片 PUT 失败（状态 ${status}${code !== undefined ? ` code=${code}` : ""}），` +
+        `${attempt}/${PRESIGNED_RETRY_ATTEMPTS - 1} 次重试…`,
+      )
+      await new Promise((resolve) => setTimeout(resolve, 1000 * attempt))
+    }
+  }
+  throw lastError
+}
+
+async function putPresignedOnce(url: string, data: Buffer): Promise<void> {
+  const controller = new AbortController()
+  const timeoutId = setTimeout(() => controller.abort(), PRESIGNED_UPLOAD_TIMEOUT)
+  const displayUrl = sanitizePresignedUrl(url)
+  console.log(`[qqbot-api] >>> PUT ${displayUrl} (${data.length} bytes, timeout: ${PRESIGNED_UPLOAD_TIMEOUT}ms)`)
+  let res: Response
+  try {
+    res = await globalThis.fetch(url, { method: "PUT", body: data, signal: controller.signal })
+  } catch (err) {
+    if (err instanceof Error && err.name === "AbortError") {
+      throw new Error(`分片 PUT 超时 [${displayUrl}]: 超过 ${PRESIGNED_UPLOAD_TIMEOUT}ms`)
+    }
+    throw new Error(`分片 PUT 网络错误 [${displayUrl}]: ${err instanceof Error ? err.message : String(err)}`)
+  } finally {
+    clearTimeout(timeoutId)
+  }
+
+  if (res.ok) {
+    console.log(`[qqbot-api] <<< PUT ${res.status} ${displayUrl}`)
+    return
+  }
+  // 失败体可能是 JSON（带官方 code），也可能不是（如 COS 的 XML）——两种都保留原文与状态码
+  const raw = await res.text().catch(() => "")
+  let parsed: unknown = raw
+  try {
+    parsed = JSON.parse(raw)
+  } catch {
+    // 非 JSON 错误体：保留原文
+  }
+  const asRecord = (typeof parsed === "object" && parsed !== null ? parsed : {}) as Record<string, unknown>
+  const code = typeof asRecord.code === "number" ? asRecord.code : undefined
+  const message = typeof asRecord.message === "string" ? asRecord.message : raw.slice(0, 300)
+  throw new QQApiError(
+    res.status,
+    displayUrl,
+    parsed,
+    `分片 PUT 失败: HTTP ${res.status}${code !== undefined ? ` code=${code}` : ""}: ${message}`,
+  )
 }
 
 /** 通过公网 URL 上传富媒体文件（C2C）：平台自动下载转存，无需本地下载，返回 file_info */

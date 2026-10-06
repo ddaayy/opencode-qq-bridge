@@ -200,12 +200,13 @@ systemctl --user enable --now openqq.service
 |------|------|------|
 | `ATTACHMENT_MAX_BYTES` | `26214400` | QQ 发来的附件体积上限（25MB） |
 | `ATTACHMENT_DIR` | `~/.openqq/attachments` | 二进制附件落盘目录 |
-| `SEND_FILE_MAX_BYTES` | `104857600` | 机器人发回文件的体积上限（100MB） |
+| `SEND_FILE_MAX_BYTES` | `209715200` | 机器人发回文件的体积上限（200MB，= QQ 官方硬限制） |
 | `SEND_FILE_HINT` | `on` | 是否在提示里注入发文件说明 |
-| `SEND_FILE_INLINE_MAX_BYTES` | `4194304` | 单次内联 base64 上传上限（4MB），超过则分片 |
-| `SEND_FILE_SPLIT` | `on` | 超过内联上限时自动分片发送 |
-| `SEND_FILE_PART_DELAY_MS` | `800` | 分片之间的发送间隔（防频控） |
-| `SEND_FILE_MAX_PARTS` | `40` | 分片数上限，超过则报错（避免刷屏） |
+| `SEND_FILE_INLINE_MAX_BYTES` | `4194304` | 单次内联 base64 上传上限（4MB），超过则走大文件路径 |
+| `SEND_FILE_SPLIT` | `on` | `off` = 超内联上限直接报错，一个请求都不发 |
+| `SEND_FILE_UPLOAD_MODE` | `chunked` | `chunked` = 官方分片上传 + 服务端合并（单文件）；`split` = 旧的多文件分片（回滚开关） |
+| `SEND_FILE_PART_DELAY_MS` | `800` | 分片之间的间隔（防频控；官方 10 QPS 要求 ≥100ms） |
+| `SEND_FILE_MAX_PARTS` | `40` | **仅 `split` 模式**：分片数上限，超过则报错 |
 
 ### 后台任务 / Markdown
 
@@ -258,9 +259,9 @@ systemctl --user enable --now openqq.service
 此时走 QQ 官方 **URL 上传**：平台自动下载转存，无需本地落盘；`file_type` 按 URL 扩展名推断
 （图片/视频/语音/文件，未知扩展按文件处理），体积限制由平台侧处理（跳过本地 `SEND_FILE_MAX_BYTES` 检查）。
 
-### 大文件：为什么必须分片
+### 大文件：官方分片上传 → 一次性下发单文件
 
-QQ 富媒体 `file_data`（base64 内联）通道实测（2026-10，`api.sgroup.qq.com`）：
+**为什么不用内联**：`file_data`（base64 内联）通道实测（2026-10，`api.sgroup.qq.com`）有硬天花板——
 
 | 文件大小 | 请求体 | 实测结果 |
 |---|---|---|
@@ -268,23 +269,41 @@ QQ 富媒体 `file_data`（base64 内联）通道实测（2026-10，`api.sgroup.
 | 5 ~ 14MB | 6.7 ~ 18.7MB | 频繁 `500 call inner proxy error`（`850012`） |
 | ≥ 20MB | ≥ 26.7MB | `413 Request Entity Too Large`（`stgw` 网关硬拒绝，无重试机会） |
 
-所以默认 `SEND_FILE_INLINE_MAX_BYTES=4MB`，超过就**自动分片**：首片作为被动回复关联原消息，
-其余片走**主动通道**（不占单 `msg_id` 4 次被动回复预算），片间隔 `SEND_FILE_PART_DELAY_MS`，
-分片临时文件用完即删。发送后会在最终文本里附说明与合并命令，例如：
+⇒ ≤`SEND_FILE_INLINE_MAX_BYTES`（默认 4MB）仍然走这条内联通道（原行为不变）。
+
+**>4MB 走官方分片上传**（2026-09 文档原话「推荐使用分片上传」），四步、收件人收到**一个**文件：
 
 ```
-📦 report.zip（48.3MB）超过单次上传上限 4.0MB，已自动分 13 片：report.zip.001 ~ report.zip.013。
-合并：cat report.zip.00* > report.zip
+POST /v2/{users|groups}/{id}/upload_prepare     # file_type/file_size(str)/file_name/md5/sha1/md5_10m
+   ↓ 返回 upload_id、block_size（默认 5MB）、parts[]{index 从 0 起, presigned_url, block_size}
+HTTP PUT  presigned_url   × N                   # 直传对象存储：不带 Authorization，也不过 api 网关（所以不会 413）
+POST /v2/{users|groups}/{id}/upload_part_finish # upload_id/part_index/block_size(str)/md5(本片)，逐片登记
+POST /v2/{users|groups}/{id}/files              # 带 upload_id 即触发**服务端合并** → file_info
+   ↓
+msg_type=7 媒体消息 × 1                         # 收件人收到单个完整文件
 ```
 
-分片数超过 `SEND_FILE_MAX_PARTS`（默认 40）时改为报错；`SEND_FILE_SPLIT=off` 则**不发任何请求**
-直接报错（干净日志，不白传几十 MB）。
+要点：
 
-**更大文件的三个建议**（也会写进给模型的系统提示）：
+- **体积上限分两层**：默认由 `SEND_FILE_MAX_BYTES`（默认 200MB）在入口拦截，超限报「文件过大 XMB（上限 YMB）」；
+  `chunked` 内部另有 200MB 硬校验**仅兜底**——只有当 `SEND_FILE_MAX_BYTES` 被调大或设为 0 时才会触发，
+  届时按官方 `850031` 口径报错。官方硬上限就是 200MB（`file_type=4` 软/硬限制都是 200MB），再大也没用。
+- **每日容量**：官方 `40093002`「超过今天发送文件容量上限」会透传成用户可见文案
+  「超过今天发送文件容量上限，请明天再试或减少文件大小」（配额用尽时重试无用）。
+- **节流**：`upload_prepare` / `upload_part_finish` 限 **10 QPS**，分片之间按 `SEND_FILE_PART_DELAY_MS`
+  （默认 800ms，远大于 100ms）节流；`upload_config.concurrency` 默认 1，实现按串行。
+- **重试**：网络错误 / 429 / 5xx / `40093001`（BDH 通道异常，官方明确让重试）各 3 次退避；
+  其它 4xx、`850031`、`40093002` 不重试。
+- **孤儿 `upload_id`**：官方**没有** abort/delete 分片任务的端点（`upload*` 只有 prepare/part_finish），
+  中途失败不做本地清理，只 `console.error` 记录 `upload_id` 与已完成分片序号，等平台 TTL 过期。
+- **回滚**：`SEND_FILE_UPLOAD_MODE=split` 立刻回到旧行为（切成 `原名.001/.002/…` 逐个下发，
+  并在文本里附 `cat 原名.00* > 原名` 合并命令）；`SEND_FILE_SPLIT=off` 仍是超内联上限直接报错、一个请求都不发。
+
+**更大文件的建议**（也会写进给模型的系统提示）：
 
 1. 先压缩（如 `zip -9`）；
 2. 提供公网 `https://` URL 走 QQ 的 URL 上传（腾讯侧下载，**不受 4MB 限制**）；
-3. 关闭分片，由人来决定怎么传。
+3. 确需原样发送才用本地路径（≤200MB）。
 
 ---
 

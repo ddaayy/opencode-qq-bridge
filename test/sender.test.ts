@@ -4,7 +4,7 @@ import { afterEach, beforeEach, describe, expect, jest, test } from "bun:test"
 import { StreamSession, sendFileToQQ, splitFileParts, detectUrlFileType, isHttpUrl, type StreamSessionOptions } from "../src/qq/sender.js"
 import { renderCopy } from "../src/copy.js"
 import type { MessageContext } from "../src/qq/types.js"
-import { mkdtempSync, writeFileSync, rmSync, readdirSync, statSync, readFileSync } from "fs"
+import { mkdtempSync, writeFileSync, rmSync, readdirSync, statSync, readFileSync, ftruncateSync, openSync, closeSync } from "fs"
 import { tmpdir } from "os"
 import { join } from "path"
 
@@ -32,6 +32,10 @@ interface Recorded {
   headers: Record<string, string>
   body: Record<string, unknown>
   ok: boolean
+  /** 原始请求体（分片 PUT 是 Buffer，其余是 JSON 字符串） */
+  raw?: unknown
+  /** Date.now() 时刻，用于断言分片节流 */
+  at?: number
 }
 
 /** fetch 记录器：可选按请求体注入失败响应（返回 Response 即失败） */
@@ -909,17 +913,62 @@ describe("sendFileToQQ", () => {
     return { type: "group", groupId: "G1", userId: "U1", msgId: "MID1", content: "hi" }
   }
 
-  /** fetch 记录器：/files 上传返回 file_info，其余按消息发送返回 id */
-  function mediaRecorder() {
+  interface MediaRecorderOptions {
+    /** upload_prepare 返回的 block_size（字节），默认 65536 */
+    blockSize?: number
+    /** upload_prepare 返回的 parts 数量（index 0..n-1，presigned_url=https://cos.example.com/part/{i}） */
+    partCount?: number
+    uploadId?: string
+    /** 注入失败响应：返回 Response 即按该响应失败 */
+    respond?: (url: string, n: number) => Response | undefined
+  }
+
+  /**
+   * fetch 记录器：/files 上传返回 file_info，upload_prepare 返回分片契约（upload_id/block_size/parts），
+   * upload_part_finish 与预签名 PUT（https://cos.example.com/part/{i}）返回 200，其余按消息发送返回 id。
+   * 只替换 globalThis.fetch，不 mock 模块函数。
+   */
+  function mediaRecorder(opts: MediaRecorderOptions = {}) {
+    const blockSize = opts.blockSize ?? 65536
+    const partCount = opts.partCount ?? 2
+    const uploadId = opts.uploadId ?? "UP-1"
     const calls: Recorded[] = []
     let n = 0
     const fetchImpl = (async (url: unknown, init?: RequestInit) => {
       n += 1
+      const u = String(url)
       const body = typeof init?.body === "string" ? (JSON.parse(init.body) as Record<string, unknown>) : {}
-      calls.push({ url: String(url), headers: (init?.headers ?? {}) as Record<string, string>, body, ok: true })
-      const payload = String(url).includes("/files")
-        ? { file_uuid: `uuid-${n}`, file_info: "FI::1", ttl: 300 }
-        : { id: `mid-${n}`, timestamp: 1 }
+      calls.push({
+        url: u,
+        headers: (init?.headers ?? {}) as Record<string, string>,
+        body,
+        ok: true,
+        raw: init?.body,
+        at: Date.now(),
+      })
+      const injected = opts.respond?.(u, n)
+      if (injected) return injected
+      let payload: unknown
+      if (u.includes("upload_prepare")) {
+        payload = {
+          upload_id: uploadId,
+          block_size: String(blockSize),
+          parts: Array.from({ length: partCount }, (_, i) => ({
+            index: i,
+            presigned_url: `https://cos.example.com/part/${i}`,
+            block_size: String(blockSize),
+          })),
+          upload_config: { concurrency: 1, retry_timeout: 300, retry_delay: 1 },
+        }
+      } else if (u.includes("upload_part_finish")) {
+        payload = { id: `fin-${n}`, timestamp: 1 }
+      } else if (u.includes("cos.example.com")) {
+        payload = {} // 预签名 PUT 成功：空体 200
+      } else if (u.includes("/files")) {
+        payload = { file_uuid: `uuid-${n}`, file_info: "FI::1", ttl: 300 }
+      } else {
+        payload = { id: `mid-${n}`, timestamp: 1 }
+      }
       return new Response(JSON.stringify(payload), { status: 200 })
     }) as typeof fetch
     return { calls, fetchImpl }
@@ -1009,7 +1058,13 @@ describe("sendFileToQQ", () => {
 
   /** 设置分片相关 env（fileSendSettings 在调用时读取），返回还原函数 */
   function setFileEnv(values: Record<string, string>): () => void {
-    const keys = ["SEND_FILE_INLINE_MAX_BYTES", "SEND_FILE_SPLIT", "SEND_FILE_PART_DELAY_MS", "SEND_FILE_MAX_PARTS"]
+    const keys = [
+      "SEND_FILE_INLINE_MAX_BYTES",
+      "SEND_FILE_SPLIT",
+      "SEND_FILE_PART_DELAY_MS",
+      "SEND_FILE_MAX_PARTS",
+      "SEND_FILE_UPLOAD_MODE",
+    ]
     const prev: Record<string, string | undefined> = {}
     for (const k of keys) prev[k] = process.env[k]
     for (const k of keys) delete process.env[k]
@@ -1041,13 +1096,14 @@ describe("sendFileToQQ", () => {
     }
   })
 
-  test("超过阈值：自动分片，首片被动、后续主动，返回合并说明并清理临时分片", async () => {
+  test("SEND_FILE_UPLOAD_MODE=split（legacy 回滚路径）：自动分片，首片被动、后续主动，返回合并说明并清理临时分片", async () => {
     const dir = mkdtempSync(join(tmpdir(), "sendfile-"))
     const prevTmp = process.env.TMPDIR
     const restore = setFileEnv({
       SEND_FILE_INLINE_MAX_BYTES: "64",
       SEND_FILE_SPLIT: "on",
       SEND_FILE_PART_DELAY_MS: "0",
+      SEND_FILE_UPLOAD_MODE: "split",
     })
     try {
       process.env.TMPDIR = dir // 让分片临时目录落在可观测范围内
@@ -1080,6 +1136,9 @@ describe("sendFileToQQ", () => {
       expect(joined.equals(payload)).toBe(true)
       expect(note).toContain("已自动分 4 片")
       expect(note).toContain("cat big.bin.00* > big.bin")
+      // 回滚路径不碰官方分片接口
+      expect(calls.some((c) => c.url.includes("upload_prepare"))).toBe(false)
+      expect(calls.some((c) => c.url.includes("upload_part_finish"))).toBe(false)
       // 发送完临时分片已删除（目录只剩原文件）
       expect(readdirSync(dir)).toEqual(["big.bin"])
     } finally {
@@ -1113,6 +1172,7 @@ describe("sendFileToQQ", () => {
       SEND_FILE_SPLIT: "on",
       SEND_FILE_PART_DELAY_MS: "0",
       SEND_FILE_MAX_PARTS: "2",
+      SEND_FILE_UPLOAD_MODE: "split",
     })
     try {
       const p = join(dir, "big.bin")
@@ -1190,6 +1250,416 @@ describe("sendFileToQQ", () => {
       const reassembled = Buffer.concat(parts.map((x) => readFileSync(x)))
       expect(reassembled.equals(payload)).toBe(true)
     } finally {
+      rmSync(dir, { recursive: true, force: true })
+    }
+  })
+
+  // ---- 官方分片上传（默认模式：单文件下发）--------------------------------
+
+  test("chunked 默认：prepare → PUT → part_finish → files(upload_id) 合并，只下发一个文件", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "sendfile-"))
+    const restore = setFileEnv({
+      SEND_FILE_INLINE_MAX_BYTES: "100",
+      SEND_FILE_SPLIT: "on",
+      SEND_FILE_PART_DELAY_MS: "0",
+      SEND_FILE_UPLOAD_MODE: "chunked",
+    })
+    try {
+      const p = join(dir, "big.bin")
+      // 两半内容不同，才能断言各分片 md5 是「本片」而非整文件
+      const payload = Buffer.concat([Buffer.alloc(100, 7), Buffer.alloc(100, 9)])
+      writeFileSync(p, payload)
+      const { calls, fetchImpl } = mediaRecorder({ blockSize: 100, partCount: 2 })
+      globalThis.fetch = fetchImpl
+
+      // 收件人侧不再有分片说明（合并由服务端完成，用户无需 cat 合并）
+      expect(await sendFileToQQ("tok", c2cCtx(), p, 0)).toBeUndefined()
+
+      // 严格顺序：prepare → PUT0 → finish0 → PUT1 → finish1 → 合并 → 媒体消息
+      expect(calls.map((c) => c.url)).toEqual([
+        "https://api.sgroup.qq.com/v2/users/U1/upload_prepare",
+        "https://cos.example.com/part/0",
+        "https://api.sgroup.qq.com/v2/users/U1/upload_part_finish",
+        "https://cos.example.com/part/1",
+        "https://api.sgroup.qq.com/v2/users/U1/upload_part_finish",
+        "https://api.sgroup.qq.com/v2/users/U1/files",
+        "https://api.sgroup.qq.com/v2/users/U1/messages",
+      ])
+
+      // prepare 请求契约：file_size 是 string；三个哈希一次流式产出
+      const prepare = calls[0].body
+      expect(prepare.file_type).toBe(4)
+      expect(prepare.file_size).toBe("200")
+      expect(typeof prepare.file_size).toBe("string")
+      expect(prepare.file_name).toBe("big.bin")
+      expect(String(prepare.md5)).toMatch(/^[0-9a-f]{32}$/)
+      expect(String(prepare.sha1)).toMatch(/^[0-9a-f]{40}$/)
+      expect(String(prepare.md5_10m)).toMatch(/^[0-9a-f]{32}$/)
+
+      // PUT 直连预签名 URL：无 Authorization（签名在 URL 里），body 就是该分片原始字节
+      expect(calls[1].headers).not.toHaveProperty("Authorization")
+      expect((calls[1].raw as Buffer).equals(payload.subarray(0, 100))).toBe(true)
+      expect((calls[3].raw as Buffer).equals(payload.subarray(100))).toBe(true)
+
+      // part_finish 逐片登记：index 从 0 起、block_size 是 string、md5 为**本片**内容
+      expect(calls[2].body).toEqual({
+        upload_id: "UP-1",
+        part_index: 0,
+        block_size: "100",
+        md5: expect.any(String),
+      })
+      expect(calls[4].body).toEqual({
+        upload_id: "UP-1",
+        part_index: 1,
+        block_size: "100",
+        md5: expect.any(String),
+      })
+      expect(calls[4].body.md5).not.toBe(calls[2].body.md5)
+
+      // 合并：/files 传 upload_id，且不带 url/file_data；随后只发一条媒体消息
+      expect(calls[5].body).toEqual({
+        file_type: 4,
+        file_name: "big.bin",
+        srv_send_msg: false,
+        upload_id: "UP-1",
+      })
+      expect(calls[5].body).not.toHaveProperty("url")
+      expect(calls[5].body).not.toHaveProperty("file_data")
+      expect(calls[6].body.msg_type).toBe(7)
+      expect((calls[6].body.media as Record<string, unknown>).file_info).toBe("FI::1")
+      expect(calls[6].body.msg_id).toBe("MID1")
+      // 验收核心：整条链路只有 1 次 /files + 1 条消息 → 收件人收到一个文件（无 .001/.002 多片）
+      expect(calls.filter((c) => c.url.includes("/files"))).toHaveLength(1)
+      expect(calls.filter((c) => c.url.includes("/messages"))).toHaveLength(1)
+    } finally {
+      restore()
+      rmSync(dir, { recursive: true, force: true })
+    }
+  })
+
+  test("chunked 群聊场景：prepare/part_finish/合并三个端点同场景", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "sendfile-"))
+    const restore = setFileEnv({
+      SEND_FILE_INLINE_MAX_BYTES: "100",
+      SEND_FILE_SPLIT: "on",
+      SEND_FILE_PART_DELAY_MS: "0",
+      SEND_FILE_UPLOAD_MODE: "chunked",
+    })
+    try {
+      const p = join(dir, "big.bin")
+      writeFileSync(p, Buffer.alloc(200, 7))
+      const { calls, fetchImpl } = mediaRecorder({ blockSize: 100, partCount: 2 })
+      globalThis.fetch = fetchImpl
+      await sendFileToQQ("tok", groupCtx(), p, 0)
+      expect(calls[0].url).toBe("https://api.sgroup.qq.com/v2/groups/G1/upload_prepare")
+      expect(calls[2].url).toBe("https://api.sgroup.qq.com/v2/groups/G1/upload_part_finish")
+      expect(calls[5].url).toBe("https://api.sgroup.qq.com/v2/groups/G1/files")
+      expect(calls[5].body.upload_id).toBe("UP-1")
+      expect(calls[6].url).toBe("https://api.sgroup.qq.com/v2/groups/G1/messages")
+    } finally {
+      restore()
+      rmSync(dir, { recursive: true, force: true })
+    }
+  })
+
+  test("chunked 节流：分片 PUT 之间至少间隔 SEND_FILE_PART_DELAY_MS（默认 800ms > 10QPS 的 100ms）", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "sendfile-"))
+    const restore = setFileEnv({
+      SEND_FILE_INLINE_MAX_BYTES: "70",
+      SEND_FILE_SPLIT: "on",
+      SEND_FILE_PART_DELAY_MS: "40",
+      SEND_FILE_UPLOAD_MODE: "chunked",
+    })
+    try {
+      const p = join(dir, "big.bin")
+      writeFileSync(p, Buffer.alloc(200, 7))
+      const { calls, fetchImpl } = mediaRecorder({ blockSize: 70, partCount: 3 })
+      globalThis.fetch = fetchImpl
+      await sendFileToQQ("tok", c2cCtx(), p, 0)
+      const putAt = calls.filter((c) => c.url.includes("cos.example.com")).map((c) => c.at as number)
+      expect(putAt).toHaveLength(3)
+      // setTimeout 只可能晚触发不可能早触发，故用 >= 断言（留 10ms 抖动余量）
+      expect(putAt[1] - putAt[0]).toBeGreaterThanOrEqual(30)
+      expect(putAt[2] - putAt[1]).toBeGreaterThanOrEqual(30)
+    } finally {
+      restore()
+      rmSync(dir, { recursive: true, force: true })
+    }
+  })
+
+  test("chunked 分片失败重试：part_finish 首次 5xx → 退避后重试成功，整条链路仍完成", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "sendfile-"))
+    const restore = setFileEnv({
+      SEND_FILE_INLINE_MAX_BYTES: "100",
+      SEND_FILE_SPLIT: "on",
+      SEND_FILE_PART_DELAY_MS: "0",
+      SEND_FILE_UPLOAD_MODE: "chunked",
+    })
+    try {
+      const p = join(dir, "big.bin")
+      writeFileSync(p, Buffer.alloc(200, 7))
+      let finishTries = 0
+      const { calls, fetchImpl } = mediaRecorder({
+        blockSize: 100,
+        partCount: 2,
+        respond: (url) => {
+          if (!url.includes("upload_part_finish")) return undefined
+          finishTries += 1
+          return finishTries === 1
+            ? new Response(JSON.stringify({ message: "call inner proxy error", code: 850012 }), { status: 500 })
+            : undefined
+        },
+      })
+      globalThis.fetch = fetchImpl
+      await sendFileToQQ("tok", c2cCtx(), p, 0)
+      expect(finishTries).toBe(3) // 片0 失败+重试成功、片1 成功
+      const finishes = calls.filter((c) => c.url.includes("upload_part_finish"))
+      expect(finishes.map((c) => c.body.part_index)).toEqual([0, 0, 1])
+      // 合并仍成功 → 收件人收到一个文件
+      expect(calls.filter((c) => c.url.includes("/files"))).toHaveLength(1)
+      expect(calls[calls.length - 1].body.msg_type).toBe(7)
+    } finally {
+      restore()
+      rmSync(dir, { recursive: true, force: true })
+    }
+  })
+
+  test("chunked 分片失败重试：40093001（BDH 通道异常，官方要求重试）→ 重试成功", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "sendfile-"))
+    const restore = setFileEnv({
+      SEND_FILE_INLINE_MAX_BYTES: "100",
+      SEND_FILE_SPLIT: "on",
+      SEND_FILE_PART_DELAY_MS: "0",
+      SEND_FILE_UPLOAD_MODE: "chunked",
+    })
+    try {
+      const p = join(dir, "big.bin")
+      writeFileSync(p, Buffer.alloc(200, 7))
+      let putTries = 0
+      const { calls, fetchImpl } = mediaRecorder({
+        blockSize: 100,
+        partCount: 2,
+        respond: (url) => {
+          if (!url.includes("cos.example.com")) return undefined
+          putTries += 1
+          return putTries === 1
+            ? new Response(JSON.stringify({ message: "文件上传失败，请重试", code: 40093001 }), { status: 400 })
+            : undefined
+        },
+      })
+      globalThis.fetch = fetchImpl
+      await sendFileToQQ("tok", c2cCtx(), p, 0)
+      expect(putTries).toBe(3) // 片0 失败+重试成功、片1 成功
+      expect(calls.filter((c) => c.url.includes("/files"))).toHaveLength(1)
+    } finally {
+      restore()
+      rmSync(dir, { recursive: true, force: true })
+    }
+  })
+
+  test("chunked 200MB 硬上限：超限直接报错，一个请求都不发（不看 SEND_FILE_MAX_BYTES）", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "sendfile-"))
+    const restore = setFileEnv({
+      SEND_FILE_INLINE_MAX_BYTES: "1024",
+      SEND_FILE_SPLIT: "on",
+      SEND_FILE_PART_DELAY_MS: "0",
+      SEND_FILE_UPLOAD_MODE: "chunked",
+    })
+    try {
+      const p = join(dir, "huge.bin")
+      const fd = openSync(p, "w")
+      try {
+        ftruncateSync(fd, 201 * 1024 * 1024) // 稀疏文件，不占磁盘
+      } finally {
+        closeSync(fd)
+      }
+      const { calls, fetchImpl } = mediaRecorder()
+      globalThis.fetch = fetchImpl
+      // maxBytes=0：绕开 bridge 的 SEND_FILE_MAX_BYTES，验证 chunked 自身的硬校验
+      await expect(sendFileToQQ("tok", c2cCtx(), p, 0)).rejects.toThrow("上传文件超过大小限制")
+      let caught: unknown
+      await sendFileToQQ("tok", c2cCtx(), p, 0).catch((e) => { caught = e })
+      expect((caught as Error).message).toContain("200MB")
+      expect((caught as Error).message).toContain("850031")
+      expect(calls).toHaveLength(0)
+    } finally {
+      restore()
+      rmSync(dir, { recursive: true, force: true })
+    }
+  })
+
+  test("chunked 分片声明总长不足：parts 覆盖字节 < 文件 size → 抛错并中止合并（不发 /files）", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "sendfile-"))
+    const restore = setFileEnv({
+      SEND_FILE_INLINE_MAX_BYTES: "100",
+      SEND_FILE_SPLIT: "on",
+      SEND_FILE_PART_DELAY_MS: "0",
+      SEND_FILE_UPLOAD_MODE: "chunked",
+    })
+    try {
+      const p = join(dir, "short.bin")
+      writeFileSync(p, Buffer.alloc(300, 7)) // 300 字节，但 upload_prepare 只声明 2×100=200 字节
+      const { calls, fetchImpl } = mediaRecorder({ blockSize: 100, partCount: 2 })
+      globalThis.fetch = fetchImpl
+      let caught: unknown
+      await sendFileToQQ("tok", c2cCtx(), p, 0).catch((e) => { caught = e })
+      expect(caught).toBeInstanceOf(Error)
+      expect((caught as Error).message).toContain("分片声明总长不足")
+      expect((caught as Error).message).toContain("期望 300 字节")
+      expect((caught as Error).message).toContain("实际覆盖 200 字节")
+      expect((caught as Error).message).toContain("已中止合并")
+      // 中止时不得调用 /files 合并接口
+      expect(calls.filter((c) => c.url.includes("/files"))).toHaveLength(0)
+    } finally {
+      restore()
+      rmSync(dir, { recursive: true, force: true })
+    }
+  })
+
+  test("chunked 850031 透传：合并返回超大小 → 不重试，错误带官方码与可执行建议", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "sendfile-"))
+    const restore = setFileEnv({
+      SEND_FILE_INLINE_MAX_BYTES: "100",
+      SEND_FILE_SPLIT: "on",
+      SEND_FILE_PART_DELAY_MS: "0",
+      SEND_FILE_UPLOAD_MODE: "chunked",
+    })
+    try {
+      const p = join(dir, "big.bin")
+      writeFileSync(p, Buffer.alloc(200, 7))
+      let mergeTries = 0
+      const { calls, fetchImpl } = mediaRecorder({
+        blockSize: 100,
+        partCount: 2,
+        respond: (url) => {
+          if (!url.includes("/files")) return undefined
+          mergeTries += 1
+          return new Response(JSON.stringify({ message: "上传文件超过大小限制", code: 850031 }), { status: 400 })
+        },
+      })
+      globalThis.fetch = fetchImpl
+      let caught: unknown
+      await sendFileToQQ("tok", c2cCtx(), p, 0).catch((e) => { caught = e })
+      expect(caught).toBeInstanceOf(Error)
+      expect((caught as Error).message).toContain("上传文件超过大小限制")
+      expect((caught as Error).message).toContain("850031")
+      expect(mergeTries).toBe(1) // 4xx 不重试
+      expect(calls.filter((c) => c.url.includes("/messages"))).toHaveLength(0)
+    } finally {
+      restore()
+      rmSync(dir, { recursive: true, force: true })
+    }
+  })
+
+  test("chunked 40093002 透传：给出用户可见文案「超过今天发送文件容量上限，请明天再试或减少文件大小」，不重试", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "sendfile-"))
+    const restore = setFileEnv({
+      SEND_FILE_INLINE_MAX_BYTES: "100",
+      SEND_FILE_SPLIT: "on",
+      SEND_FILE_PART_DELAY_MS: "0",
+      SEND_FILE_UPLOAD_MODE: "chunked",
+    })
+    try {
+      const p = join(dir, "big.bin")
+      writeFileSync(p, Buffer.alloc(200, 7))
+      let mergeTries = 0
+      const { calls, fetchImpl } = mediaRecorder({
+        blockSize: 100,
+        partCount: 2,
+        respond: (url) => {
+          if (!url.includes("/files")) return undefined
+          mergeTries += 1
+          return new Response(JSON.stringify({ message: "超过今天发送文件容量上限", code: 40093002 }), { status: 400 })
+        },
+      })
+      globalThis.fetch = fetchImpl
+      let caught: unknown
+      await sendFileToQQ("tok", c2cCtx(), p, 0).catch((e) => { caught = e })
+      expect((caught as Error).message).toContain("超过今天发送文件容量上限，请明天再试或减少文件大小")
+      expect((caught as Error).message).toContain("40093002")
+      expect(mergeTries).toBe(1) // 每日配额用尽，重试无用
+      expect(calls.filter((c) => c.url.includes("/messages"))).toHaveLength(0)
+    } finally {
+      restore()
+      rmSync(dir, { recursive: true, force: true })
+    }
+  })
+
+  test("chunked 回归：≤内联阈值仍走 file_data 内联，完全不碰 upload_prepare", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "sendfile-"))
+    const restore = setFileEnv({ SEND_FILE_INLINE_MAX_BYTES: "1024", SEND_FILE_UPLOAD_MODE: "chunked" })
+    try {
+      const p = join(dir, "small.bin")
+      const payload = Buffer.alloc(200, 7)
+      writeFileSync(p, payload)
+      const { calls, fetchImpl } = mediaRecorder()
+      globalThis.fetch = fetchImpl
+      expect(await sendFileToQQ("tok", c2cCtx(), p, 0)).toBeUndefined()
+      expect(calls).toHaveLength(2)
+      expect(calls[0].body.file_data).toBe(payload.toString("base64"))
+      expect(calls[0].body).not.toHaveProperty("upload_id")
+      expect(calls.some((c) => c.url.includes("upload_prepare"))).toBe(false)
+      expect(calls.some((c) => c.url.includes("upload_part_finish"))).toBe(false)
+    } finally {
+      restore()
+      rmSync(dir, { recursive: true, force: true })
+    }
+  })
+
+  test("chunked 回归：SEND_FILE_SPLIT=off 时超阈值仍一个请求都不发（契约不变）", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "sendfile-"))
+    const restore = setFileEnv({
+      SEND_FILE_INLINE_MAX_BYTES: "100",
+      SEND_FILE_SPLIT: "off",
+      SEND_FILE_UPLOAD_MODE: "chunked",
+    })
+    try {
+      const p = join(dir, "big.bin")
+      writeFileSync(p, Buffer.alloc(200, 7))
+      const { calls, fetchImpl } = mediaRecorder()
+      globalThis.fetch = fetchImpl
+      await expect(sendFileToQQ("tok", c2cCtx(), p, 0)).rejects.toThrow("超过 QQ 内联上传上限")
+      expect(calls).toHaveLength(0)
+    } finally {
+      restore()
+      rmSync(dir, { recursive: true, force: true })
+    }
+  })
+
+  test("chunked 孤儿 upload_id：分片中途失败时记录 upload_id 与已完成分片（官方无 abort 端点，只等 TTL）", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "sendfile-"))
+    const restore = setFileEnv({
+      SEND_FILE_INLINE_MAX_BYTES: "100",
+      SEND_FILE_SPLIT: "on",
+      SEND_FILE_PART_DELAY_MS: "0",
+      SEND_FILE_UPLOAD_MODE: "chunked",
+    })
+    const errLines: string[] = []
+    const origErr = console.error
+    console.error = (...args: unknown[]) => {
+      errLines.push(args.map((a) => (a instanceof Error ? `${a.message}` : String(a))).join(" "))
+    }
+    try {
+      const p = join(dir, "big.bin")
+      writeFileSync(p, Buffer.alloc(200, 7))
+      const { fetchImpl } = mediaRecorder({
+        blockSize: 100,
+        partCount: 2,
+        respond: (url) =>
+          url.includes("/part/1")
+            ? new Response(JSON.stringify({ message: "分片损坏", code: 850019 }), { status: 400 })
+            : undefined,
+      })
+      globalThis.fetch = fetchImpl
+      await expect(sendFileToQQ("tok", c2cCtx(), p, 0)).rejects.toThrow()
+      const orphan = errLines.find((l) => l.includes("upload_id=UP-1"))
+      expect(orphan).toBeDefined()
+      expect(orphan).toContain("已完成分片=[0]")
+      expect(orphan).toContain("index=1")
+      expect(orphan).toContain("TTL")
+    } finally {
+      console.error = origErr
+      restore()
       rmSync(dir, { recursive: true, force: true })
     }
   })

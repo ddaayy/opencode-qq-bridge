@@ -126,13 +126,14 @@ Bun >= 1.0；`ws`（QQ Gateway）。已移除 `@opencode-ai/sdk` 依赖。
 - 支持一次多个（多行多个标记）。
 - 也接受 `file:///path` 形式。
 - 类型按扩展名自动判定：图片=1 / 视频=2 / 语音=3 / 其它=4（文件）。
-- 体积上限 `SEND_FILE_MAX_BYTES`（默认 100MB）；失败会在最终文本里附加 `⚠ 文件发送失败：…`。
+- 体积上限 `SEND_FILE_MAX_BYTES`（默认 200MB，= QQ 官方硬限制）；≤4MB 内联上传，
+  >4MB 走官方分片上传并一次性下发单文件（见下节）；失败会在最终文本里附加 `⚠ 文件发送失败：…`。
 - 桥会在用户消息末尾注入一句 `[系统提示] … [[sendfile:/绝对路径]]`，让模型知道该约定（`SEND_FILE_HINT=off` 可关闭）。
 
 > 示例：用户"把当前目录打包成 zip 发我" → AI 执行 `zip -r /tmp/xx.zip .` →
 > 回复中写 `[[sendfile:/tmp/xx.zip]]` → 桥把 zip 发给该用户。
 
-### 大文件自动分片（413 根因与修复）
+### 大文件：官方分片上传（413 根因与修复）
 
 **现象**：发 40+MB 的 zip，`file_data` base64 达 48MB → 网关
 `<<< Status: 413 Request Entity Too Large  server: stgw`，请求体原样被拒。
@@ -147,21 +148,42 @@ Bun >= 1.0；`ws`（QQ Gateway）。已移除 `@opencode-ai/sdk` 依赖。
 | 20 / 30 / 36 / 40MB | 26.7 ~ 48MB | `413`（<1s，网关硬拒绝） |
 
 ⇒ **可靠内联上限 ≈ 4MB**；19~27MB 请求体之间是 413 的硬边界。
+这条 `file_data` 内联通道**仍是 ≤4MB 的默认路径**（原行为不变）；>4MB 改走官方分片上传，
+分片 PUT 直连对象存储、不过 api 网关，因此**结构上不会**再撞这个 413。
 
-**实现**（`src/qq/sender.ts`）：
+**实现**（`src/qq/api.ts` 传输层 + `src/qq/sender.ts` 策略层）：
 
 - 阈值内（`SEND_FILE_INLINE_MAX_BYTES`，默认 4MB）→ 原单次内联上传，行为不变。
-- 超阈值且 `SEND_FILE_SPLIT=on`（默认）→ `splitFileParts()` 切片：
-  - 定宽编号 `原名.001/.002/…`（`cat 原名.00* > 原名` 字典序即正确顺序）；
-  - **首片被动**（带 `msg_id`），**其余片主动**（不带 `msg_id`，绕开单 `msg_id` 4 次被动预算）；
-  - 片间隔 `SEND_FILE_PART_DELAY_MS`（默认 800ms）防频控；
-  - 临时目录用完 `rmSync` 清理；返回可读说明（片数 + 合并命令）拼进最终文本。
-- 分片数 > `SEND_FILE_MAX_PARTS`（默认 40）→ 报错，避免刷屏。
-- `SEND_FILE_SPLIT=off` → 超阈值**一个请求都不发**，直接给出含大小与建议的错误。
-- 重试：仅网络错误 / 429 / 5xx，最多 3 次（退避 1s、2s）；**413 与其它 4xx 不重试**。
+- 超阈值且 `SEND_FILE_SPLIT=on`（默认）→ 按 `SEND_FILE_UPLOAD_MODE` 分派（默认 `chunked`）：
+  - `upload_prepare`（`file_type`/`file_size` 是 **string**/`file_name`/整文件 `md5`/`sha1`/`md5_10m`
+    = 前 10002432 字节的 MD5，三个哈希**一次流式**产出，1MB 步进，200MB 文件也不进内存两遍）；
+  - 逐片 `HTTP PUT presigned_url`（**不带 Authorization**，不过网关），再 `upload_part_finish`
+    （`upload_id`/`part_index`（index 从 0 起）/`block_size`(str)/本片 `md5`）；
+  - `POST /files` 带 `upload_id` 触发**服务端合并** → `file_info` → 只发一条 `msg_type=7` 消息。
+  - **收件人收到单个完整文件**：没有 `.001/.002` 多片，也不再有 `cat … > …` 合并命令文案
+    （`sendFileToQQ` 在该模式下返回 `undefined`）。
+- 单聊 / 群聊三个端点同场景（官方规定预上传、分片、合并端点相互独立）。
+- **节流**：`upload_prepare` / `upload_part_finish` 官方限 10 QPS，分片间按
+  `SEND_FILE_PART_DELAY_MS`（默认 800ms ≥ 100ms）节流；`upload_config.concurrency` 默认 1，串行实现。
+- **重试**：网络错误 / 429 / 5xx / `40093001`（BDH 通道异常，官方明确让重试）最多 3 次退避
+  （1s、2s）；其它 4xx、`850031`、`40093002` 不重试。
+- **体积上限分两层**：默认由 `SEND_FILE_MAX_BYTES`（默认 200MB）在入口拦截，超限报「文件过大 XMB（上限 YMB）」；
+  `chunked` 内部另有 200MB 硬校验**仅兜底**——只有当 `SEND_FILE_MAX_BYTES` 被调大或设为 0 时才会触发，
+  届时按官方 `850031` 口径报错。官方硬上限就是 200MB（`file_type=4` 软/硬限制都是 200MB），再大也没用。
+- **每日容量**：`40093002` 透传成用户可见文案「超过今天发送文件容量上限，请明天再试或减少文件大小」。
+- **孤儿 `upload_id`**：官方**没有** abort/delete 分片任务的端点（`upload*` 只有 prepare/part_finish），
+  中途失败不做本地清理，只 `console.error` 记 `upload_id` + 已完成分片序号，等平台 TTL 过期。
+- **回滚**：`SEND_FILE_UPLOAD_MODE=split` 立刻回到旧行为（`splitFileParts()` 定宽编号
+  `原名.001/.002/…`，首片被动、其余主动，片间隔 `SEND_FILE_PART_DELAY_MS`，临时目录用完 `rmSync` 清理，
+  返回「已自动分 N 片…合并：`cat 原名.00* > 原名`」拼进最终文本）；`SEND_FILE_MAX_PARTS`（默认 40）仅该模式检查。
+  `SEND_FILE_SPLIT=off` → 超阈值**一个请求都不发**，直接给出含大小与建议的错误。
 - `apiRequest` 对**非 JSON 错误体**（413 返回 HTML）改为抛 `QQApiError`，
   保留 `HTTP 413 Request Entity Too Large` 与前 300 字符原文，不再退化成
-  `Failed to parse response` 把根因藏掉。
+  `Failed to parse response` 把根因藏掉。`putPresigned()` 对非 JSON 错误体（如对象存储 XML）同理。
+
+**未在本环境端到端验证**：真实分片流程需要可用真实 token 打通到发送路径，本机只有契约级单测
+（替换 `globalThis.fetch` 记录 prepare/PUT/part_finish/合并的调用序列与请求体）。
+上线后需人工发一次 >4MB 文件验收（收件人侧确认只收到一个文件）。
 
 **已知替代通道**：`[[sendfile:https://…]]` 走平台 URL 上传，由腾讯侧下载，**不受内联 body 上限**。
 本机为 NAT 内网（无公网入站），可用 Tailscale Funnel 临时把本地文件暴露成公网 https URL

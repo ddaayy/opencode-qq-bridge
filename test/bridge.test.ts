@@ -1,7 +1,7 @@
 // bridge.test.ts — 桥接层回归：STREAMING=off 黄金文案 / PROGRESS_TOOL_CALL 门控 / 群聊不走流式 / 流式接线
 import "./setup-env.js"
 import { afterEach, beforeEach, describe, expect, jest, test } from "bun:test"
-import { createBridge, resolveSendPath } from "../src/bridge.js"
+import { createBridge, resolveSendPath, sendFileHintText, SEND_FILE_MAX_BYTES } from "../src/bridge.js"
 import type { Config } from "../src/config.js"
 import type { EventRouter } from "../src/opencode/events.js"
 import type { SessionManager } from "../src/opencode/sessions.js"
@@ -326,5 +326,36 @@ describe("resolveSendPath", () => {
     expect(resolveSendPath("/tmp/a.txt")).toBe("/tmp/a.txt")
     expect(resolveSendPath("relative/a.txt")).toBe("relative/a.txt")
     expect(resolveSendPath("file:///tmp/a.txt")).toBe("/tmp/a.txt")
+  })
+})
+
+// ---- 发文件：体积上限与系统提示文案（必须与 sender.ts 实现一致）-------------
+
+describe("发文件上限与系统提示", () => {
+  test("SEND_FILE_MAX_BYTES 默认 200MB（= QQ 官方 file_type=4 硬限制）", () => {
+    expect(SEND_FILE_MAX_BYTES).toBe(200 * 1024 * 1024)
+  })
+
+  test("提示：>4MB 走官方分片上传并一次性下发（单文件、无需合并）+ 体积上限两层口径", () => {
+    const hint = sendFileHintText()
+    expect(hint).toContain(">4MB")
+    expect(hint).toContain("官方分片上传")
+    expect(hint).toContain("一次性下发")
+    expect(hint).toContain("单个完整文件")
+    expect(hint).toContain("无需手动合并")
+    expect(hint).toContain("200MB")
+    expect(hint).toContain("850031")
+    // 新口径：默认由 SEND_FILE_MAX_BYTES 在入口拦截报「文件过大」；chunked 内部 200MB 硬校验仅兜底
+    expect(hint).toContain("SEND_FILE_MAX_BYTES")
+    expect(hint).toContain("文件过大")
+    expect(hint).toContain("兜底")
+  })
+
+  test("提示：旧说法（会刷很多条 / 需要手动合并 / 100MB / 超了会报 850031）已删除", () => {
+    const hint = sendFileHintText()
+    expect(hint).not.toContain("会刷很多条")
+    expect(hint).not.toContain("需要手动合并")
+    expect(hint).not.toContain("100MB")
+    expect(hint).not.toContain("超了会报 850031")
   })
 })

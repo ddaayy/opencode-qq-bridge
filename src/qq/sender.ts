@@ -9,6 +9,11 @@ import {
   uploadGroupFile,
   uploadC2CFileByUrl,
   uploadGroupFileByUrl,
+  uploadPrepareC2C,
+  uploadPrepareGroup,
+  uploadPartFinishC2C,
+  uploadPartFinishGroup,
+  putPresigned,
   sendC2CMediaMessage,
   sendGroupMediaMessage,
   sendStreamMessage,
@@ -18,6 +23,7 @@ import {
   type StreamShardResponse,
 } from "./api.js"
 import { closeSync, mkdirSync, mkdtempSync, openSync, readFileSync, readSync, rmSync, statSync, writeFileSync } from "fs"
+import { createHash } from "crypto"
 import { tmpdir } from "os"
 import { basename, join } from "path"
 import type { MessageContext } from "./types.js"
@@ -209,12 +215,20 @@ export function urlFileName(rawUrl: string): string | undefined {
  * - ≤4.5MB 文件（≈6MB 请求体）稳定 200；
  * - 5~14MB 频繁 `500 call inner proxy error (850012)`（上传慢/网关超时）；
  * - 请求体 ≥约 19~27MB 被网关 `stgw` 直接 `413 Request Entity Too Large`，无重试机会。
- * 因此把安全阈值定为 4MB：超过就分片，绝不撞 500/413。
+ * 因此把安全阈值定为 4MB：≤4MB 走内联原样，>4MB 走官方分片上传（不过网关，不会再撞 500/413）。
  */
 const DEFAULT_INLINE_MAX_BYTES = 4 * 1024 * 1024
 const DEFAULT_PART_DELAY_MS = 800
 const DEFAULT_MAX_PARTS = 40
 const UPLOAD_RETRY_ATTEMPTS = 3
+/** 官方硬限制：文件（file_type=4）软/硬上限都是 200MB；超硬限制直接报错（官方错误码 850031） */
+const MAX_SINGLE_FILE_BYTES = 200 * 1024 * 1024
+/** 官方 md5_10m 口径：前 10002432 字节的 MD5 */
+const MD5_10M_BYTES = 10_002_432
+/** 流式哈希步进 1MB：200MB 文件也只占 1MB 内存（不把整文件读进内存两遍） */
+const HASH_STEP_BYTES = 1024 * 1024
+/** 官方「文件上传失败，请重试」：大文件分片上传中 BDH 通道异常，官方明确让重试 */
+const RETRYABLE_UPLOAD_CODE = 40093001
 
 /** 分片/阈值参数（调用时读 env，便于测试与热改） */
 function fileSendSettings(): {
@@ -222,6 +236,7 @@ function fileSendSettings(): {
   split: boolean
   partDelayMs: number
   maxParts: number
+  mode: "chunked" | "split"
 } {
   const inlineMaxBytes = Number(process.env.SEND_FILE_INLINE_MAX_BYTES ?? DEFAULT_INLINE_MAX_BYTES)
   return {
@@ -229,6 +244,8 @@ function fileSendSettings(): {
     split: (process.env.SEND_FILE_SPLIT ?? "on").toLowerCase() !== "off",
     partDelayMs: Number(process.env.SEND_FILE_PART_DELAY_MS ?? DEFAULT_PART_DELAY_MS),
     maxParts: Number(process.env.SEND_FILE_MAX_PARTS ?? DEFAULT_MAX_PARTS),
+    // chunked = 官方分片上传 + 服务端合并（单文件，默认）；split = 旧的多文件分片行为（回滚开关）
+    mode: (process.env.SEND_FILE_UPLOAD_MODE ?? "chunked").toLowerCase() === "split" ? "split" : "chunked",
   }
 }
 
@@ -236,7 +253,7 @@ function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms))
 }
 
-/** 上传/发送的有限重试：仅对网络错误、429、5xx 重试；4xx（含 413）与业务错误直接抛出 */
+/** 上传/发送的有限重试：仅对网络错误、429、5xx、40093001（BDH 通道异常）重试；4xx（含 413、850031、40093002）与其它业务错误直接抛出 */
 async function withSendRetry<T>(label: string, fn: () => Promise<T>): Promise<T> {
   let lastError: unknown
   for (let attempt = 1; attempt <= UPLOAD_RETRY_ATTEMPTS; attempt++) {
@@ -245,13 +262,33 @@ async function withSendRetry<T>(label: string, fn: () => Promise<T>): Promise<T>
     } catch (error) {
       lastError = error
       const status = error instanceof QQApiError ? error.status : 0
-      const retryable = status === 0 || status === 429 || status >= 500
+      const code = error instanceof QQApiError ? error.code : undefined
+      const retryable = status === 0 || status === 429 || status >= 500 || code === RETRYABLE_UPLOAD_CODE
       if (!retryable || attempt === UPLOAD_RETRY_ATTEMPTS) break
-      console.warn(`[sender] ${label} 失败（状态 ${status}），${attempt}/${UPLOAD_RETRY_ATTEMPTS - 1} 次重试…`)
+      console.warn(`[sender] ${label} 失败（状态 ${status}${code !== undefined ? ` code=${code}` : ""}），${attempt}/${UPLOAD_RETRY_ATTEMPTS - 1} 次重试…`)
       await sleep(1000 * attempt)
     }
   }
   throw lastError
+}
+
+/** 官方业务错误码 → 用户可见文案；其余错误原样抛出（保留 QQApiError 与原始 message） */
+function translateUploadError(error: unknown): unknown {
+  if (!(error instanceof QQApiError) || typeof error.code !== "number") return error
+  const suffix = `（官方错误码 ${error.code}）`
+  if (error.code === 40093002) {
+    // 每日发送文件容量上限：不是本机问题，重试无用，明天的配额才是
+    return new Error(`超过今天发送文件容量上限，请明天再试或减少文件大小${suffix}`, { cause: error })
+  }
+  if (error.code === 850031) {
+    return new Error(`上传文件超过大小限制${suffix}：QQ 文件单文件硬上限 200MB，请压缩后重试或改用公网 https URL。`, {
+      cause: error,
+    })
+  }
+  if (error.code === 850019) {
+    return new Error(`QQ 不支持该文件格式${suffix}，请压缩（zip）或改用公网 https URL。`, { cause: error })
+  }
+  return error
 }
 
 /** 上传单个本地文件并发富媒体消息；passive=false 走主动通道（不带 msg_id，不占被动回复预算） */
@@ -280,8 +317,163 @@ async function uploadAndSendLocalFile(
 }
 
 /**
+ * 单次流式产出官方预上传需要的三个哈希（整文件 md5/sha1 + 前 10002432 字节的 md5_10m）。
+ * 1MB 步进只占 1MB 内存；200MB 文件不会被读进内存两遍。
+ */
+function hashFileForUpload(path: string): { md5: string; sha1: string; md5_10m: string } {
+  const md5 = createHash("md5")
+  const sha1 = createHash("sha1")
+  const md5_10m = createHash("md5")
+  const buf = Buffer.alloc(HASH_STEP_BYTES)
+  const fd = openSync(path, "r")
+  try {
+    let offset = 0
+    let covered = 0
+    for (;;) {
+      const read = readSync(fd, buf, 0, buf.length, offset)
+      if (read <= 0) break
+      const chunk = buf.subarray(0, read)
+      md5.update(chunk)
+      sha1.update(chunk)
+      if (covered < MD5_10M_BYTES) {
+        const take = Math.min(read, MD5_10M_BYTES - covered)
+        md5_10m.update(chunk.subarray(0, take))
+        covered += take
+      }
+      offset += read
+    }
+  } finally {
+    closeSync(fd)
+  }
+  return { md5: md5.digest("hex"), sha1: sha1.digest("hex"), md5_10m: md5_10m.digest("hex") }
+}
+
+/**
+ * 官方「分片上传 + 服务端合并」：upload_prepare → 逐片 PUT 预签名 URL → upload_part_finish →
+ * POST /files 传 upload_id 让服务端合并 → 发**一条** msg_type=7 媒体消息。
+ * 收件人最终只收到一个完整文件（没有 .001/.002 多片，也不需要 cat 合并）；
+ * 分片直传对象存储不过 api 网关，因此不再撞 413。官方文档原话「推荐使用分片上传」。
+ *
+ * 场景隔离：prepare/part_finish/合并三者必须同场景（单聊与群聊端点互不相通）。
+ * 节流：upload_prepare 与 upload_part_finish 限 10 QPS（两次调用间隔 ≥100ms），
+ * 默认 SEND_FILE_PART_DELAY_MS=800ms 留足余量；upload_config.concurrency 默认 1，这里串行。
+ */
+async function sendFileChunked(
+  accessToken: string,
+  ctx: MessageContext,
+  path: string,
+  fileName: string,
+  size: number,
+  partDelayMs: number,
+  passive: boolean,
+): Promise<void> {
+  // 官方硬限制 200MB：不看 SEND_FILE_MAX_BYTES（可能被调大），超了直接拒绝，不浪费带宽
+  if (size > MAX_SINGLE_FILE_BYTES) {
+    throw new Error(
+      `上传文件超过大小限制：${(size / 1048576).toFixed(1)}MB（QQ 文件单文件硬上限 200MB，官方错误码 850031）。` +
+        `请压缩后重试，或改用公网 https URL。`,
+    )
+  }
+
+  const fileType = detectOutboundFileType(fileName)
+  const groupOpenid = ctx.type === "group" && ctx.groupId ? ctx.groupId : undefined
+  const prepareOptions = { fileType, fileSize: String(size), fileName, ...hashFileForUpload(path) }
+  const prepared = await withSendRetry(`upload_prepare ${fileName}`, () =>
+    groupOpenid
+      ? uploadPrepareGroup(accessToken, groupOpenid, prepareOptions)
+      : uploadPrepareC2C(accessToken, ctx.userId, prepareOptions),
+  )
+
+  // 官方契约：parts[].index 从 0 起；防御性排序，保证上传/登记顺序即索引顺序
+  const parts = [...(prepared.parts ?? [])].sort((a, b) => a.index - b.index)
+  if (parts.length === 0) {
+    throw new Error(`upload_prepare 未返回分片信息: ${JSON.stringify(prepared)}`)
+  }
+
+  const maxBlock = Math.max(1, ...parts.map((p) => Number(p.block_size) || 0))
+  const buf = Buffer.allocUnsafe(maxBlock)
+  const done: number[] = []
+  let currentIndex = -1
+  const fd = openSync(path, "r")
+  try {
+    let offset = 0
+    for (const part of parts) {
+      currentIndex = part.index
+      const declared = Number(part.block_size) || 0
+      const length = Math.min(declared > 0 ? declared : size - offset, size - offset)
+      const read = length > 0 ? readSync(fd, buf, 0, length, offset) : 0
+      const data = Buffer.from(buf.subarray(0, Math.max(0, read))) // copy：循环复用 buf
+      // ① 直传对象存储（无 Authorization，签名在 URL 里）
+      try {
+        await withSendRetry(`分片 PUT #${part.index} ${fileName}`, () => putPresigned(part.presigned_url, data))
+      } catch (error) {
+        // 错误里保留分片序号与文件名（URL 已由 putPresignedOnce 净化，只含 pathname）；
+        // 保留 QQApiError 类型与 code，translateUploadError 仍能按官方码翻译
+        if (error instanceof QQApiError) {
+          throw new QQApiError(error.status, error.path, error.body, `分片 #${part.index}（${fileName}）: ${error.message}`)
+        }
+        throw new Error(`分片 #${part.index}（${fileName}）PUT 失败: ${error instanceof Error ? error.message : String(error)}`, {
+          cause: error,
+        })
+      }
+      // ② 登记该分片（md5 是**本片**内容的 MD5）
+      const finishOptions = {
+        uploadId: prepared.upload_id,
+        partIndex: part.index,
+        blockSize: String(data.length),
+        md5: createHash("md5").update(data).digest("hex"),
+      }
+      await withSendRetry(`upload_part_finish #${part.index} ${fileName}`, () =>
+        groupOpenid
+          ? uploadPartFinishGroup(accessToken, groupOpenid, finishOptions)
+          : uploadPartFinishC2C(accessToken, ctx.userId, finishOptions),
+      )
+      done.push(part.index)
+      offset += data.length
+      if (offset >= size) break // 防御：分片声明总和超过实际大小时提前收口
+      if (partDelayMs > 0) await sleep(partDelayMs)
+    }
+    // 收口断言：parts 声明总长不足时中止，绝不带着残缺分片去合并（合并接口 /files 不会被调用）
+    if (offset < size) {
+      throw new Error(`分片声明总长不足（期望 ${size} 字节，实际覆盖 ${offset} 字节），已中止合并`)
+    }
+  } catch (error) {
+    // 孤儿 upload_id：官方**没有** abort/delete 分片任务的端点（upload* 只有 prepare/part_finish），
+    // 所以不做本地清理，只记录 upload_id 与已完成分片，等平台 TTL 自然过期。
+    console.error(
+      `[sender] 分片上传失败：upload_id=${prepared.upload_id} 已完成分片=[${done.join(",")}] ` +
+        `失败分片 index=${currentIndex} file=${fileName} ` +
+        `（官方无 abort 端点，该 upload_id 将由平台 TTL 回收，无需也无法本地清理）`,
+      error,
+    )
+    throw error
+  } finally {
+    closeSync(fd)
+  }
+
+  // ③ 服务端合并：传 upload_id 即走合并路径（url 可为空），拿 file_info 后只发一条媒体消息
+  const msgId = passive ? ctx.msgId : undefined
+  const msgSeq = passive ? getNextMsgSeq(ctx.msgId) : undefined
+  const mergeOptions = { fileType, fileName, uploadId: prepared.upload_id }
+  await withSendRetry(`合并 ${fileName}`, async () => {
+    if (groupOpenid) {
+      const fileInfo = await uploadGroupFile(accessToken, groupOpenid, mergeOptions)
+      await sendGroupMediaMessage(accessToken, groupOpenid, fileInfo, msgId, msgSeq)
+    } else {
+      const fileInfo = await uploadC2CFile(accessToken, ctx.userId, mergeOptions)
+      await sendC2CMediaMessage(accessToken, ctx.userId, fileInfo, msgId, msgSeq)
+    }
+  })
+  console.log(
+    `[sender] 分片上传完成：${fileName} ${(size / 1048576).toFixed(1)}MB upload_id=${prepared.upload_id} ` +
+      `parts=${parts.length} → 服务端合并为 1 个文件`,
+  )
+}
+
+/**
  * 按 partSize 把 src 切成若干分片写入临时目录（outDir 缺省自建），分片名 = 原名 + `.001`/`.002`…
  * 定宽编号保证 `cat 原名.00* > 原名` 的字典序即正确顺序。
+ * 仅 legacy split 模式（SEND_FILE_UPLOAD_MODE=split）使用。
  */
 export function splitFileParts(src: string, partSize: number, outDir?: string): string[] {
   const stat = statSync(src)
@@ -310,9 +502,12 @@ export function splitFileParts(src: string, partSize: number, outDir?: string): 
  * 把本机文件或公网 URL 发送给 QQ 用户/群（先上传富媒体，再发 msg_type=7 消息，作为被动回复关联原消息）。
  * http(s) URL 走官方 URL 上传：平台自动下载转存，跳过本地读取与 SEND_FILE_MAX_BYTES 体积检查（大小限制由平台侧处理）。
  *
- * 本地文件超过 SEND_FILE_INLINE_MAX_BYTES（默认 4MB）时按 SEND_FILE_SPLIT 自动分片：
- * 首片作为被动回复，其余走主动通道（绕开单 msg_id 4 次被动预算），分片文件用完即删。
- * 返回非空字符串 = 需要展示给用户的分片说明（合并命令等）。
+ * 本地文件按 SEND_FILE_INLINE_MAX_BYTES（默认 4MB）分流：
+ * - 阈值内 → 原 `file_data` base64 内联一次上传，行为不变；
+ * - 超阈值且 SEND_FILE_SPLIT=on → 按 SEND_FILE_UPLOAD_MODE（默认 chunked）分派：
+ *   - `chunked`（默认）：官方分片上传 + 服务端合并，收件人收到**一个**文件（sendFileChunked）；
+ *   - `split`：旧行为，切 N 个文件逐个下发并返回「cat … > …」合并说明（回滚路径）。
+ * 返回非空字符串 = 需要展示给用户的分片说明（仅 legacy split 模式会产生）。
  */
 export async function sendFileToQQ(
   accessToken: string,
@@ -343,7 +538,7 @@ export async function sendFileToQQ(
   }
 
   const name = basename(filePath)
-  const { inlineMaxBytes, split, partDelayMs, maxParts } = fileSendSettings()
+  const { inlineMaxBytes, split, partDelayMs, maxParts, mode } = fileSendSettings()
   const passive = Boolean(ctx.msgId)
 
   // 阈值内：一次内联上传（原行为）
@@ -354,7 +549,6 @@ export async function sendFileToQQ(
 
   const sizeMb = (stat.size / 1048576).toFixed(1)
   const inlineMb = (inlineMaxBytes / 1048576).toFixed(1)
-  const total = Math.ceil(stat.size / inlineMaxBytes)
 
   if (!split) {
     throw new Error(
@@ -362,6 +556,19 @@ export async function sendFileToQQ(
         `请压缩后重试、改用公网 URL，或开启分片。`,
     )
   }
+
+  // 默认：官方分片上传 + 服务端合并 → 收件人收到一个文件（无合并说明文案）
+  if (mode === "chunked") {
+    try {
+      await sendFileChunked(accessToken, ctx, filePath, name, stat.size, partDelayMs, passive)
+    } catch (error) {
+      throw translateUploadError(error)
+    }
+    return undefined
+  }
+
+  // legacy split（旧行为 / 回滚路径）：切成 N 个文件逐个下发，用户手动合并
+  const total = Math.ceil(stat.size / inlineMaxBytes)
   if (total > maxParts) {
     throw new Error(
       `${sizeMb}MB 需分 ${total} 片，超过 SEND_FILE_MAX_PARTS=${maxParts}。请压缩后重试或调高该值。`,

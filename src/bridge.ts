@@ -34,9 +34,27 @@ const CHECK_INTERVAL_MS = 15 * 1000
 const ATTACHMENT_MAX_BYTES = Number(process.env.ATTACHMENT_MAX_BYTES ?? 25 * 1024 * 1024)
 // 附件落盘目录（供 AI 用工具读取二进制文件，如 .sqlite）
 const ATTACHMENT_DIR = process.env.ATTACHMENT_DIR ?? join(homedir(), ".openqq", "attachments")
-// 机器人向用户发送文件的体积上限，以及是否在提示里注入"如何发文件"的说明
-const SEND_FILE_MAX_BYTES = Number(process.env.SEND_FILE_MAX_BYTES ?? 100 * 1024 * 1024)
+// 机器人向用户发送文件的体积上限（默认 200MB = QQ 官方 file_type=4 硬限制，官方错误码 850031），
+// 以及是否在提示里注入"如何发文件"的说明；>4MB 走官方分片上传并一次性下发单文件
+export const SEND_FILE_MAX_BYTES = Number(process.env.SEND_FILE_MAX_BYTES ?? 200 * 1024 * 1024)
 const SEND_FILE_HINT = (process.env.SEND_FILE_HINT ?? "on").toLowerCase() !== "off"
+
+/**
+ * 注入给模型的"如何发文件"系统提示（导出便于单测锁定文案与实现一致）。
+ * 事实口径：≤4MB 走 base64 内联；>4MB 走官方分片上传 upload_prepare → PUT → upload_part_finish →
+ * files(upload_id) 服务端合并，收件人收到**一个**完整文件，无需手动合并；单文件硬上限 200MB。
+ */
+export function sendFileHintText(): string {
+  return (
+    "[系统提示] 需要把本地文件发给用户时，请在回复中单独一行写：[[sendfile:/绝对路径]]（多个文件用多行）。\n" +
+    "文件大小：≤4MB 直接内联上传；>4MB 会自动走 QQ 官方分片上传并一次性下发（收件人收到单个完整文件，无需手动合并）。\n" +
+    "体积上限：默认由 SEND_FILE_MAX_BYTES（默认 200MB）在入口拦截，超限报「文件过大 XMB（上限 YMB）」；" +
+    "官方硬上限同为 200MB（file_type=4 软/硬限制都是 200MB），仅当 SEND_FILE_MAX_BYTES 被调大或设为 0 时" +
+    "才触发 chunked 内部 200MB 硬校验兜底，按官方 850031 口径报错；再大也没用，请压缩或改用 URL。\n" +
+    "大文件优先考虑：① 先压缩（如 zip -9）；② 提供公网 https URL（[[sendfile:https://...]]，由腾讯侧下载，不受 4MB 限制）；" +
+    "③ 确需原样发送才用本地路径。"
+  )
+}
 // 一轮结束后继续监视会话（后台任务完成时 AI 会自动继续输出）
 const MONITOR_ENABLED = (process.env.MONITOR ?? "on").toLowerCase() !== "off"
 const MONITOR_MAX_MS = Number(process.env.MONITOR_MAX_MS ?? 2 * 60 * 60 * 1000)
@@ -808,11 +826,7 @@ async function startSessionPrompt(
   let promptText = notes.length > 0 ? (text ? `${text}\n\n${notes.join("\n")}` : notes.join("\n")) : text
 
   if (SEND_FILE_HINT) {
-    const hint =
-      "[系统提示] 需要把本地文件发给用户时，请在回复中单独一行写：[[sendfile:/绝对路径]]（多个文件用多行）。\n" +
-      "文件大小：QQ 单次内联上传上限约 4MB，超过时桥会自动分片发送（会刷很多条、用户需手动合并）。" +
-      "大文件优先考虑：① 先压缩（如 zip -9）；② 提供公网 https URL（[[sendfile:https://...]]，由腾讯侧下载，不受 4MB 限制）；" +
-      "③ 确需原样发送才用本地路径。"
+    const hint = sendFileHintText()
     promptText = promptText ? `${promptText}\n\n${hint}` : hint
   }
 

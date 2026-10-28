@@ -56,6 +56,16 @@ class FakeRouter {
     this.permissionCallbacks.push(cb)
   }
 
+  formCallbacks: Array<(e: unknown) => void> = []
+
+  registerFormCallback(cb: (e: unknown) => void): void {
+    this.formCallbacks.push(cb)
+  }
+
+  hasListener(sessionId: string): boolean {
+    return this.listeners.has(sessionId)
+  }
+
   emit(e: EventEnvelope): void {
     const sid = (e.data as Record<string, unknown> | undefined)?.sessionID
     if (typeof sid === "string") this.listeners.get(sid)?.(e)
@@ -89,16 +99,38 @@ function makeConfig(
   }
 }
 
-function makeClient(): OpencodeClient {
+function makeClient(
+  opts: {
+    /** 记录对 OpenCode 的调用（prompt / form.reply / form.cancel） */
+    calls?: Array<{ url: string; body?: unknown }>
+    /** listBySession 返回的待答表单（模拟服务端已有 pending form） */
+    pendingForms?: Array<Record<string, unknown>>
+  } = {},
+): OpencodeClient {
+  const calls = opts.calls ?? []
   const client = {
     server: { baseUrl: "http://local", password: "" },
     reconnect: async () => false,
     session: {
-      prompt: async () => ({}),
+      prompt: async (params: unknown) => {
+        calls.push({ url: "session.prompt", body: params })
+        return {}
+      },
       messages: async () => ({ data: [] }),
     },
     permission: { reply: async () => ({}) },
     event: { subscribe: () => ({}) },
+    form: {
+      listBySession: async () => ({ data: opts.pendingForms ?? [] }),
+      reply: async (params: { sessionID: string; formID: string; answer: Record<string, unknown> }) => {
+        calls.push({ url: `form.reply/${params.formID}`, body: params.answer })
+        return {}
+      },
+      cancel: async (params: { sessionID: string; formID: string }) => {
+        calls.push({ url: `form.cancel/${params.formID}` })
+        return {}
+      },
+    },
   }
   return client as unknown as OpencodeClient
 }
@@ -106,6 +138,8 @@ function makeClient(): OpencodeClient {
 function makeSessions(): SessionManager {
   return {
     getOrCreate: async () => ({ sessionId: SID }),
+    getSession: () => ({ sessionId: SID }),
+    findUserIdBySessionId: () => "U1",
     getModel: () => ({}),
     getAgent: () => undefined,
   } as unknown as SessionManager
@@ -357,5 +391,177 @@ describe("发文件上限与系统提示", () => {
     expect(hint).not.toContain("需要手动合并")
     expect(hint).not.toContain("100MB")
     expect(hint).not.toContain("超了会报 850031")
+  })
+})
+
+// ---- AI 提问（question 工具 → pending form） --------------------------------
+
+/** 与线上真实 pending form 同构的题目（两题） */
+function questionForm(): { id: string; sessionID: string; title: string; metadata: Record<string, unknown>; fields: Array<Record<string, unknown>> } {
+  return {
+    id: "frm_q1",
+    sessionID: SID,
+    title: "Questions",
+    metadata: { kind: "question", tool: { messageID: "msg_1", id: "call_1" } },
+    fields: [
+      {
+        key: "q0",
+        title: "是否现在装",
+        description: "要我现在直接帮你装好吗？",
+        type: "string",
+        options: [
+          { value: "装 A (推荐)", label: "装 A (推荐)", description: "推荐理由" },
+          { value: "只装 B", label: "只装 B" },
+          { value: "先别装", label: "先别装" },
+        ],
+        custom: true,
+      },
+      {
+        key: "q1",
+        title: "拉哪个模型",
+        type: "string",
+        options: [
+          { value: "m1 (推荐)", label: "m1 (推荐)" },
+          { value: "m2", label: "m2" },
+        ],
+        custom: true,
+      },
+    ],
+  }
+}
+
+function emitFormEvent(router: FakeRouter, type: "created" | "cancelled" | "replied"): void {
+  router.formCallbacks[0]?.({ type, ...questionForm() })
+}
+
+describe("bridge AI 提问（question 表单）", () => {
+  test("form.created → 主动推送题目（标题/选项/作答提示齐全）", async () => {
+    const router = new FakeRouter()
+    createBridge(makeConfig(), makeClient(), router as unknown as EventRouter, makeSessions())
+    emitFormEvent(router, "created")
+    await waitFor(() => apiCalls.some((c) => c.body?.msg_type === 2 && !c.body?.msg_id))
+    const pushed = apiCalls.filter((c) => c.body?.msg_type === 2 && !c.body?.msg_id)
+    const text = markdownContent(pushed[0].body)
+    expect(text).toContain("**第 1 题：是否现在装**")
+    expect(text).toContain("**第 2 题：拉哪个模型**")
+    expect(text).toContain("要我现在直接帮你装好吗？")
+    expect(text).toContain("1. 装 A (推荐)")
+    expect(text).toContain("3. 先别装")
+    expect(text).toContain("按顺序回复每题的序号，例如：1 1")
+    expect(text).toContain("/cancel")
+  })
+
+  test("回复序号 → 提交 form.reply（不转发新 prompt）并确认", async () => {
+    const router = new FakeRouter()
+    const ocCalls: Array<{ url: string; body?: unknown }> = []
+    const bridge = createBridge(
+      makeConfig(),
+      makeClient({ calls: ocCalls }),
+      router as unknown as EventRouter,
+      makeSessions(),
+    )
+    emitFormEvent(router, "created")
+    await waitFor(() => apiCalls.some((c) => c.body?.msg_type === 2 && !c.body?.msg_id))
+
+    await bridge.handleMessage({ type: "c2c", userId: "U1", msgId: "MID2", content: "1 2" })
+    await waitFor(() => ocCalls.some((c) => c.url.startsWith("form.reply/")))
+
+    expect(ocCalls.find((c) => c.url === "form.reply/frm_q1")?.body).toEqual({
+      q0: "装 A (推荐)",
+      q1: "m2",
+    })
+    // 不应把这条消息当成新 prompt 转发给 opencode
+    expect(ocCalls.some((c) => c.url === "session.prompt")).toBe(false)
+    const replies = apiCalls.filter((c) => c.body?.msg_id === "MID2")
+    expect(replies).toHaveLength(1)
+    expect(markdownContent(replies[0].body)).toContain("已选择：是否现在装=装 A (推荐)；拉哪个模型=m2")
+
+    // 作答后没有在途等待 → 桥重新挂监听接管后续输出，喂 idle 让它收尾，避免测试泄漏定时器
+    await waitFor(() => router.listeners.has(SID))
+    router.emit(ev("session.execution.succeeded"))
+    await waitFor(() => !router.listeners.has(SID))
+  })
+
+  test("/cancel → 放弃提问并恢复可对话", async () => {
+    const router = new FakeRouter()
+    const ocCalls: Array<{ url: string; body?: unknown }> = []
+    const bridge = createBridge(
+      makeConfig(),
+      makeClient({ calls: ocCalls }),
+      router as unknown as EventRouter,
+      makeSessions(),
+    )
+    emitFormEvent(router, "created")
+    await waitFor(() => apiCalls.some((c) => c.body?.msg_type === 2 && !c.body?.msg_id))
+
+    await bridge.handleMessage({ type: "c2c", userId: "U1", msgId: "MID3", content: "/cancel" })
+    await waitFor(() => ocCalls.some((c) => c.url.startsWith("form.cancel/")))
+    expect(ocCalls.some((c) => c.url === "form.cancel/frm_q1")).toBe(true)
+    const replies = apiCalls.filter((c) => c.body?.msg_id === "MID3")
+    expect(markdownContent(replies[0].body)).toContain("已放弃本次提问")
+
+    // 提问已丢弃：同一条内容之后按普通消息走
+    void bridge.handleMessage({ type: "c2c", userId: "U1", msgId: "MID4", content: "1 2" })
+    await waitFor(() => router.listeners.has(SID))
+    expect(ocCalls.some((c) => c.url === "form.reply/frm_q1")).toBe(false)
+    router.emit(ev("session.execution.succeeded"))
+    await waitFor(() => !router.listeners.has(SID))
+  })
+
+  test("内存态为空但服务端仍有表单 → 补发题目并拦下消息（不转发）", async () => {
+    const router = new FakeRouter()
+    const ocCalls: Array<{ url: string; body?: unknown }> = []
+    const bridge = createBridge(
+      makeConfig(),
+      makeClient({ calls: ocCalls, pendingForms: [questionForm()] }),
+      router as unknown as EventRouter,
+      makeSessions(),
+    )
+    await bridge.handleMessage({ type: "c2c", userId: "U1", msgId: "MID5", content: "你好" })
+
+    // 补发的题目（主动）+ 拦截提示（被动）
+    const pushed = apiCalls.filter((c) => c.body?.msg_type === 2 && !c.body?.msg_id)
+    expect(markdownContent(pushed[0].body)).toContain("是否现在装")
+    const replies = apiCalls.filter((c) => c.body?.msg_id === "MID5")
+    expect(markdownContent(replies[0].body)).toContain("AI 正在等你回答")
+    expect(ocCalls.some((c) => c.url === "session.prompt")).toBe(false)
+
+    // 第二条消息已被内存态接管为「作答」
+    void bridge.handleMessage({ type: "c2c", userId: "U1", msgId: "MID6", content: "2 1" })
+    await waitFor(() => ocCalls.some((c) => c.url === "form.reply/frm_q1"))
+    expect(ocCalls.find((c) => c.url === "form.reply/frm_q1")?.body).toEqual({ q0: "只装 B", q1: "m1 (推荐)" })
+    await waitFor(() => router.listeners.has(SID))
+    router.emit(ev("session.execution.succeeded"))
+    await waitFor(() => !router.listeners.has(SID))
+  })
+
+  test("已切换会话后，旧提问不再拦截（/new 场景）", async () => {
+    const router = new FakeRouter()
+    const ocCalls: Array<{ url: string; body?: unknown }> = []
+    const bound = { sessionId: SID }
+    const sessions = {
+      getOrCreate: async () => bound,
+      getSession: () => bound,
+      getModel: () => ({}),
+      getAgent: () => undefined,
+      findUserIdBySessionId: () => "U1",
+    } as unknown as SessionManager
+    const bridge = createBridge(
+      makeConfig(),
+      makeClient({ calls: ocCalls }),
+      router as unknown as EventRouter,
+      sessions,
+    )
+    emitFormEvent(router, "created")
+    await waitFor(() => apiCalls.some((c) => c.body?.msg_type === 2 && !c.body?.msg_id))
+
+    // 用户切到别的会话：旧提问作废，消息按新会话正常转发
+    bound.sessionId = "ses_other"
+    await bridge.handleMessage({ type: "c2c", userId: "U1", msgId: "MID7", content: "1 2" })
+    await waitFor(() => router.listeners.has("ses_other"))
+    expect(ocCalls.some((c) => c.url.startsWith("form.reply/"))).toBe(false)
+    expect(ocCalls.some((c) => c.url === "session.prompt")).toBe(true)
+    router.emit(ev("session.execution.succeeded", { sessionID: "ses_other" }))
+    await waitFor(() => !router.listeners.has("ses_other"))
   })
 })

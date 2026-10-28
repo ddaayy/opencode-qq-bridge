@@ -208,6 +208,14 @@ export class SessionManager {
     return this.sessions.get(userId)
   }
 
+  /** 反查：sessionId → userId（把 SSE 里的表单/权限事件路由回对应的 QQ 用户） */
+  findUserIdBySessionId(sessionId: string): string | undefined {
+    for (const [userId, session] of this.sessions) {
+      if (session.sessionId === sessionId) return userId
+    }
+    return undefined
+  }
+
   setModel(userId: string, providerId: string, modelId: string): void {
     const s = this.sessions.get(userId)
     if (s) {

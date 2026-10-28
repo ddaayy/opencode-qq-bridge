@@ -6,7 +6,7 @@ QQ 机器人 ↔ OpenCode 对话桥（bun + TypeScript，V2 API）。给 AI 协�
 
 | 用途 | 命令 | 说明 |
 |---|---|---|
-| 跑测试 | `bun test` | 5 个文件，基线 `158 pass / 0 fail` |
+| 跑测试 | `bun test` | 7 个文件，基线 `185 pass / 0 fail` |
 | 类型检查 | `npx tsc --noEmit` | 即 `bun run typecheck` |
 | 本地启动 | `bun run src/index.ts` | `bun run dev` 为 watch 模式 |
 | 服务 | `systemctl --user restart openqq.service` | 入口 `bin/openqq.js`，内容仅 `import "../src/index.ts"`，**直接跑源码，无构建步骤** |
@@ -15,10 +15,11 @@ QQ 机器人 ↔ OpenCode 对话桥（bun + TypeScript，V2 API）。给 AI 协�
 
 ## 结构
 
-- `src/bridge.ts` — 与 opencode 会话对接、注入给模型的系统提示（`sendFileHintText()`）、附件落盘、投递文本/文件
+- `src/bridge.ts` — 与 opencode 会话对接、注入给模型的系统提示（`sendFileHintText()`）、附件落盘、投递文本/文件、AI 提问（`question` 表单）推送与作答拦截
 - `src/qq/api.ts` — 传输层：token、`apiRequest`、消息与富媒体端点、分片上传三端点、日志脱敏
 - `src/qq/sender.ts` — 策略层：普通回复、流式 `StreamSession`、文件发送（内联 / chunked / legacy split）
 - `src/qq/gateway.ts` — WebSocket 网关
+- `src/opencode/questions.ts` — V2 表单（AI 的 `question` 工具）解析 / 渲染 / 序号作答翻译（纯函数）
 - `test/*.test.ts` — bun test
 
 ## 测试约定（必须遵守）

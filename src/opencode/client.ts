@@ -279,6 +279,38 @@ export class OpencodeClient {
       }).then((r) => ({ data: r.data ?? [] })),
   }
 
+  // ---- 表单（AI 的 question 工具挂起后等用户答复） ----
+  readonly form = {
+    /** 全局待答表单（Form.Info[]，含 sessionID） */
+    list: (params?: { query?: Query }) =>
+      this.request<{ data: Array<Record<string, unknown>> }>("GET", "/api/form", {
+        query: params?.query,
+      }).then((r) => ({ data: r.data ?? [] })),
+
+    /** 某会话的待答表单 */
+    listBySession: (params: { path: { id: string }; query?: Query }) =>
+      this.request<{ data: Array<Record<string, unknown>> }>(
+        "GET",
+        `/api/session/${encodeURIComponent(params.path.id)}/form`,
+        { query: params.query },
+      ).then((r) => ({ data: r.data ?? [] })),
+
+    /** 提交答案，body 为 { answer: { fieldKey: value } }，成功返回 204 无 body */
+    reply: (params: { sessionID: string; formID: string; answer: Record<string, unknown> }) =>
+      this.request(
+        "POST",
+        `/api/session/${encodeURIComponent(params.sessionID)}/form/${encodeURIComponent(params.formID)}/reply`,
+        { body: { answer: params.answer } },
+      ),
+
+    /** 放弃提问，成功返回 204 无 body；已答复时服务端回 409 */
+    cancel: (params: { sessionID: string; formID: string }) =>
+      this.request(
+        "DELETE",
+        `/api/session/${encodeURIComponent(params.sessionID)}/form/${encodeURIComponent(params.formID)}`,
+      ),
+  }
+
   // ---- 权限 ----
   readonly permission = {
     reply: (params: { sessionID: string; requestID: string; reply: "once" | "always" | "reject" }) =>

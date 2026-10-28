@@ -12,9 +12,17 @@ import { join } from "path"
 import { homedir } from "os"
 import { fileURLToPath } from "url"
 import type { OpencodeClient } from "./opencode/client.js"
-import { EventRouter } from "./opencode/events.js"
+import { EventRouter, type FormEvent } from "./opencode/events.js"
 import { SessionManager } from "./opencode/sessions.js"
 import type { EventEnvelope } from "./opencode/client.js"
+import {
+  isCancelAnswer,
+  isQuestionForm,
+  parseQuestionAnswer,
+  parseQuestionForm,
+  renderQuestionMessage,
+  type QuestionForm,
+} from "./opencode/questions.js"
 import {
   handleCommand,
   handlePendingSelection,
@@ -110,6 +118,160 @@ export function createBridge(
     activeStreams.get(sessionId),
   )
 
+  // AI 提问（V2 question 工具 → pending form）：推给 QQ 用户，用户回复序号即提交答案
+  const pendingQuestions = new Map<string, QuestionForm>()
+
+  router.registerFormCallback((event) => {
+    void onFormEvent(event).catch((error) => console.error("[bridge] 处理表单事件失败:", toErrorMessage(error)))
+  })
+
+  async function onFormEvent(event: FormEvent): Promise<void> {
+    const userId = sessions.findUserIdBySessionId(event.sessionID)
+    if (!userId) {
+      console.log(`[bridge] 表单 ${event.type} 无绑定用户，忽略 session=${event.sessionID.slice(0, 16)}…`)
+      return
+    }
+    if (event.type !== "created") {
+      pendingQuestions.delete(userId)
+      return
+    }
+    const form = parseQuestionForm(event)
+    if (!form) {
+      console.log(`[bridge] 表单结构无法解析（无 fields），忽略 form=${event.id.slice(0, 16)}…`)
+      return
+    }
+    if (pendingQuestions.has(userId)) {
+      console.log(`[bridge] 用户已有未答提问，被新提问覆盖 uid=${userId.slice(0, 8)}…`)
+    }
+    pendingQuestions.set(userId, form)
+    console.log(`[bridge] AI 提问 uid=${userId.slice(0, 8)}… form=${form.id.slice(0, 16)}… 题数=${form.fields.length}`)
+    // 主动消息：提问发生在回合中途，被动回复窗口大概率已过期
+    await sendFormToUser(userId, form)
+  }
+
+  async function sendFormToUser(userId: string, form: QuestionForm): Promise<void> {
+    const ctx: MessageContext = { type: "c2c", userId, msgId: "", content: "" }
+    await sendProactiveReply(ctx, renderQuestionMessage(form))
+  }
+
+  /**
+   * 用户消息是否在回答一个待答提问。
+   * 返回 true 表示已按「作答」处理完毕（含错误提示），不再走常规消息流程。
+   */
+  async function maybeHandleQuestionAnswer(ctx: MessageContext): Promise<boolean> {
+    const bound = sessions.getSession(ctx.userId)
+    let form = pendingQuestions.get(ctx.userId) ?? null
+    if (form && bound?.sessionId && form.sessionID !== bound.sessionId) {
+      // 已切换会话（/new、/sessions），旧提问作废
+      pendingQuestions.delete(ctx.userId)
+      form = null
+    }
+    if (!form) {
+      // 兜底：桥重启或 SSE 丢失时，直接问服务端要当前会话的待答表单。
+      // 表单只在「已答复 / 已放弃」后消失，所以查到即说明 AI 正卡在等答案。
+      if (!bound?.sessionId) return false
+      let raw: Record<string, unknown> | undefined
+      try {
+        const list = await client.form.listBySession({ path: { id: bound.sessionId } })
+        raw = (list.data ?? []).find((item) => isQuestionForm(item))
+      } catch (error) {
+        console.error("[bridge] 查询待答表单失败（忽略）:", toErrorMessage(error))
+        return false
+      }
+      const fetched = parseQuestionForm(raw)
+      if (!fetched) {
+        if (isCancelAnswer(ctx.content)) {
+          await sendReply(ctx, "当前没有待答的提问")
+          return true
+        }
+        return false
+      }
+      pendingQuestions.set(ctx.userId, fetched)
+      // 补发题目（只发一次，后续消息走上面的内存态分支），并拦下这条消息：
+      // 会话正阻塞在提问上，转发新 prompt 只会堆在后面
+      await sendFormToUser(ctx.userId, fetched)
+      await sendReply(ctx, "AI 正在等你回答上面的问题——回复序号即可，回复 /cancel 放弃提问后可继续对话")
+      return true
+    }
+
+    if (isCancelAnswer(ctx.content)) {
+      await cancelQuestion(ctx.userId, form)
+      await sendReply(ctx, "已放弃本次提问，可继续对话")
+      return true
+    }
+
+    const parsed = parseQuestionAnswer(form, ctx.content)
+    if (!parsed) return false
+    if (parsed.kind === "error") {
+      await sendReply(ctx, `❓ ${parsed.message}`)
+      return true
+    }
+
+    try {
+      await client.form.reply({ sessionID: form.sessionID, formID: form.id, answer: parsed.answer })
+    } catch (error) {
+      pendingQuestions.delete(ctx.userId)
+      await sendReply(ctx, `提交答案失败：${toErrorMessage(error)}（该提问可能已失效，可直接继续对话）`)
+      return true
+    }
+    pendingQuestions.delete(ctx.userId)
+    console.log(`[bridge] 提问已作答 uid=${ctx.userId.slice(0, 8)}… form=${form.id.slice(0, 16)}… answer=${parsed.summary}`)
+    await sendReply(ctx, `已选择：${parsed.summary}\nAI 继续处理中…`)
+
+    // 本轮等待还活着就交给它；已结束（超时/重启）则重新挂一个等待，把后续输出转给用户
+    if (!router.hasListener(form.sessionID)) {
+      void collectContinuation(ctx, form.sessionID, Date.now())
+    }
+    return true
+  }
+
+  async function cancelQuestion(userId: string, form: QuestionForm): Promise<void> {
+    pendingQuestions.delete(userId)
+    try {
+      await client.form.cancel({ sessionID: form.sessionID, formID: form.id })
+    } catch (error) {
+      // 已被答复/已失效（409/404）都无所谓，本侧已丢弃
+      console.log(`[bridge] 放弃提问失败（忽略）: ${toErrorMessage(error)}`)
+    }
+  }
+
+  /** 提问作答后，若原等待已结束，则单独收集 AI 的后续输出并主动投递 */
+  async function collectContinuation(ctx: MessageContext, sessionId: string, startedAt: number): Promise<void> {
+    let progressUsed = 0
+    let lastProgressAt = 0
+    const notify = async (scene: Scene, vars: CopyVars): Promise<void> => {
+      if (!config.progress.enabled) return
+      if (config.progress.max > 0 && progressUsed >= config.progress.max) return
+      progressUsed++
+      const wait = config.progress.minIntervalMs - (Date.now() - lastProgressAt)
+      if (wait > 0) await new Promise((r) => setTimeout(r, wait))
+      lastProgressAt = Date.now()
+      await sendProactiveReply(ctx, renderCopy(scene, vars, config.texts))
+    }
+    try {
+      const { text, backgroundShells } = await waitForSessionReply(
+        router,
+        client,
+        sessionId,
+        () => {
+          // 不发新 prompt：只是把提问之后 AI 继续说的话接回来
+        },
+        ctx.userId,
+        config.opencode.workspaceDir,
+        notify,
+        startedAt,
+        undefined,
+        config.progress,
+        () => pendingQuestions.has(ctx.userId),
+      )
+      await deliverResult(ctx, text, "proactive")
+      if (MONITOR_ENABLED) startMonitor(ctx, sessionId, backgroundShells)
+    } catch (error) {
+      console.error(`[bridge] 提问后续输出收集失败 session=${sessionId.slice(0, 16)}…:`, toErrorMessage(error))
+      await sendProactiveReply(ctx, `⚠️ 提问后的处理中断：${toErrorMessage(error)}`).catch(() => {})
+    }
+  }
+
   const handleMessage = async (ctx: MessageContext): Promise<void> => {
     try {
       console.log(`[bridge] handleMessage type=${ctx.type} uid=${ctx.userId} content="${ctx.content.slice(0, 40)}" att=${ctx.attachments?.length ?? 0} msgId=${ctx.msgId.slice(-16)}`)
@@ -124,11 +286,15 @@ export function createBridge(
         return
       }
 
-      if (content && isCommand(content)) {
+      if (content && isCommand(content) && !isCancelAnswer(content)) {
         const reply = await handleCommand(ctx, commandContext)
         await sendReply(ctx, reply)
         return
       }
+
+      // AI 提问（question 工具）：优先按「作答 / 放弃」处理，避免被当成新 prompt，
+      // 也避免 /cancel 被当命令透传给 opencode
+      if (content && (await maybeHandleQuestionAnswer(ctx))) return
 
       const pendingReply = content ? await maybeHandlePendingSelection(ctx, commandContext) : null
       if (pendingReply !== null) {
@@ -256,6 +422,7 @@ export function createBridge(
           if (stream) void stream.pushBody(delta)
         },
         config.progress,
+        () => pendingQuestions.has(ctx.userId),
       )
 
       // 等进度消息都发完，再发最终结果，保证顺序
@@ -563,6 +730,8 @@ async function waitForSessionReply(
   startedAt: number = Date.now(),
   onDelta?: (delta: string) => void,
   progress: ProgressConfig = DEFAULT_PROGRESS,
+  /** 正在等用户回答 AI 的提问：期间不按「无活动」判超时，也不发心跳刷屏 */
+  awaitingUser: () => boolean = () => false,
 ): Promise<{ text: string; backgroundShells: string[] }> {
   let settled = false
   let currentText = ""
@@ -653,9 +822,10 @@ async function waitForSessionReply(
       if (settled) return
       const now = Date.now()
       const idleMs = now - lastActivityAt
+      const holdingForAnswer = awaitingUser()
 
-      // 中间进度心跳：长时间无输出时告知仍在处理
-      if (now - lastHeartbeatAt >= progress.heartbeatMs && idleMs >= CHECK_INTERVAL_MS) {
+      // 中间进度心跳：长时间无输出时告知仍在处理（等用户回答时不刷屏，题目本身就是信号）
+      if (!holdingForAnswer && now - lastHeartbeatAt >= progress.heartbeatMs && idleMs >= CHECK_INTERVAL_MS) {
         lastHeartbeatAt = now
         const elapsed = Math.max(0, now - startedAt)
         const mins = Math.floor(elapsed / 60000)
@@ -672,8 +842,9 @@ async function waitForSessionReply(
         }
       }
 
-      // 仅当长时间「完全无活动」才判超时（有输出/工具调用会持续续期）
-      if (idleMs >= RESPONSE_IDLE_TIMEOUT_MS) {
+      // 仅当长时间「完全无活动」才判超时（有输出/工具调用会持续续期）；
+      // 等用户回答 AI 提问期间不判超时，但绝对上限仍然生效
+      if (!holdingForAnswer && idleMs >= RESPONSE_IDLE_TIMEOUT_MS) {
         finish(() =>
           reject(new Error(`AI 长时间无响应（${Math.round(RESPONSE_IDLE_TIMEOUT_MS / 60000)} 分钟无输出）`)),
         )
@@ -743,6 +914,9 @@ async function waitForSessionReply(
         case "session.reasoning.delta":
         case "session.step.ended":
         case "session.step.started":
+        case "form.created":
+        case "form.replied":
+        case "form.cancelled":
           lastActivityAt = Date.now()
           return
         case "session.execution.succeeded":

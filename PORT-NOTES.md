@@ -199,6 +199,38 @@ POST /files(upload_id) 200 → messages 200`，桥日志 `[sender] 分片上传�
 本机为 NAT 内网（无公网入站），可用 Tailscale Funnel 临时把本地文件暴露成公网 https URL
 （需 tailnet 开启 Funnel：`https://login.tailscale.com/f/funnel?node=…`）。
 
+## AI 提问（`question` 工具 → V2 表单）
+
+上游把「AI 问选择题」当作普通工具调用，桥只看到 `session.tool.input.started`（`name=question`），
+既推不出题目也没有回传答案的通道——用户侧表现为**提问石沉大海**，会话卡在 `executed:false, status:"running"`。
+
+V2 把这件事建模成**表单（form）**，桥按下面的契约接：
+
+| 端点 / 事件 | 用途 |
+|---|---|
+| `GET /api/form` | 全局待答表单（`{location, data: Form.Info[]}`） |
+| `GET /api/session/{id}/form` | 某会话的待答表单 |
+| `POST /api/session/{id}/form/{fid}/reply` |  body `{answer: {fieldKey: value}}`，成功 **204 无 body** |
+| `DELETE /api/session/{id}/form/{fid}` | 放弃提问，204；已答复则 **409 FormAlreadySettled** |
+| SSE `form.created` / `form.replied` / `form.cancelled` | 表单新增 / 已答 / 已取消，data 即 `Form.Info`（带 `sessionID`） |
+
+`Form.Info` = `{id, sessionID, title, metadata, fields}`，`metadata.kind === "question"` 时是 `question` 工具创建的；
+`fields[i]` = `{key:"q0", title, description, type:"string"|"multiselect", options:[{value,label,description}], custom}`。
+答案是 `{q0: options[i].value}`，多选题为 `string[]`（`Form.Value`）。
+
+**实现要点**
+
+- `EventRouter` 新增 `registerFormCallback`（与 `registerPermissionCallback` 同为「最后注册者生效」）
+  与 `hasListener(sessionId)`（判断本轮等待是否还活着）。表单事件**不 `continue`**，
+  继续分发给会话监听者，让 `waitForSessionReply` 的 watchdog 续期（否则等用户作答会被判「无活动超时」）。
+- `SessionManager.findUserIdBySessionId()` 反查 userId，把表单事件路由回对应的 QQ 用户。
+- 渲染 / 序号翻译是纯函数 `src/opencode/questions.ts`，不碰网络，便于单测。
+- 作答后若**没有在途等待**（超时过 / 桥重启过），用 `waitForSessionReply(startPrompt = 空)` 重新挂一个
+  监听把 AI 后续输出接回来（`collectContinuation`），结果走**主动消息**。
+- 待答表单 = 会话被阻塞，所以查到就拦下用户消息（补发题目 + 提示先作答），不向已阻塞会话转发新 prompt。
+- 表单没有时间戳，无法判「新旧」；但表单只在答复/取消后删除，所以「查到即阻塞」成立。
+  用户切走会话（`/new`、`/sessions`）时按 `sessionID` 不匹配丢弃旧提问。
+
 ## 后台任务（长命令自动转后台）
 
 OpenCode 会把耗时较长的 shell 命令**移到后台**（工具返回 `Command moved to the background (shell ID: sh_…)`），

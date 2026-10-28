@@ -7,6 +7,22 @@
 
 ### Added
 
+- **AI 提问（`question` 工具 → 选择题）打通**：AI 调 `question` 时 OpenCode 会挂起执行并创建待答表单，
+  此前桥既推不出题目也没有回传答案的通道，表现为提问石沉大海、会话卡在 `executed:false`。
+  - SSE `form.created` → 以**主动消息**推题目（标题 / 说明 / 编号选项 / 作答提示）。
+  - 用户回复序号 → `POST /api/session/{id}/form/{fid}/reply`，回执 `已选择：题=选项` 后 AI 继续；
+    多题按顺序（`1 2`）、多选题 `1 3` 或 `1+3 2`、允许 `custom` 的题可直接回文字。
+  - `/cancel`（或 `取消`）→ `DELETE .../form/{fid}` 放弃提问；无待答提问时回「当前没有待答的提问」。
+  - 桥重启 / SSE 断连后按 `GET /api/session/{id}/form` 兜底补发；查到待答表单即视为会话阻塞，
+    拦下新消息并提示先作答，不再向已阻塞会话转发 prompt。
+  - 作答后若本轮等待已结束，`collectContinuation` 重新挂监听把后续输出接回主动消息。
+  - 新增 `src/opencode/questions.ts`（纯函数：解析 / 渲染 / 序号翻译）、`OpencodeClient.form.*`、
+    `EventRouter.registerFormCallback` + `hasListener`、`SessionManager.findUserIdBySessionId`。
+  - **线上实测校正**：`form.created` 的 data 是 `{form: Form.Info}`（外层包一层），
+    `form.cancelled` / `form.replied` 才是平铺的 `{id, sessionID, answer?}`——`normalizeForm` 统一解包。
+  - 等用户作答期间 `waitForSessionReply` 不按「无活动」判超时、也不发心跳（题目本身即信号），
+    绝对上限 `RESPONSE_MAX_MS` 仍然生效。
+
 - **QQ 官方分片上传（>4MB 一次性下发单文件）**：超过 `SEND_FILE_INLINE_MAX_BYTES`（默认 4MB）的本地文件改走官方四步流程
   `upload_prepare` → 逐片 `PUT` 预签名 URL → `upload_part_finish` → `files(upload_id)` 合并，
   收件人拿到**一个完整文件**，不再产生 `.001/.002` 多片与 `cat 原名.00* > 原名` 手动合并命令。
@@ -27,6 +43,10 @@
 
 ### Fixed
 
+- **AI 的 `question`（选择题）提问到不了 QQ 用户**：桥原本只把 `question` 当普通工具调用看待，
+  既没有渲染题目的通道，也没有回传答案的 API，导致用户侧「提问石沉大海」、会话永久卡在
+  `executed:false / status:"running"`（线上 casaos 会话从 07:23 卡到 16:00 未解）。
+  现按 V2 表单契约接入（见 Added 第一条），并把 `/cancel` 纳入命令拦截，避免被透传给 OpenCode。
 - **分片预签名 URL 签名外泄**：`upload_prepare` 的响应体日志原样打印 `presigned_url`（签名在 query 里）。
   新增 `sanitizePresignedUrl` / `sanitizeResponseBodyLog`（`src/qq/api.ts`），日志只保留 `pathname`、query/hash 换成 `?<已省略>`；
   错误 message 同样净化并附带「分片 #N（文件名）」上下文；**实际请求仍使用完整带签名 URL**，`apiRequest` 返回值不受污染。
@@ -41,12 +61,18 @@
 
 - `README.md`、`PORT-NOTES.md` 的「大文件」章节改写为官方分片上传口径，保留 `file_data` base64 内联通道的 413 实测表作为历史依据
   （该通道仍是 ≤4MB 的默认路径；实测：请求体 19~27MB 起被 `stgw` 网关 `413 Request Entity Too Large` 硬拒绝）。
+- 新增 `README.md`「AI 提问（选择题 / `question` 工具）」章节与命令表 `/cancel` 行、
+  `PORT-NOTES.md`「AI 提问（`question` 工具 → V2 表单）」章节（端点/事件契约与实现要点）。
 - 新增本文件与 `AGENTS.md`。
 
 ### Verification
 
-- `bun test` → `158 pass / 0 fail / 526 expect()`（5 个文件）。
+- `bun test` → `185 pass / 0 fail / 615 expect()`（7 个文件：新增 `test/questions.test.ts` 18 例、
+  `test/events.test.ts` 4 例、`bridge.test.ts` 提问链路 5 例）。
 - `npx tsc --noEmit` → 退出码 0。
+- **SSE 真实形状已验证（2026-10-09）**：用临时 session 建表单 → 桥日志
+  `[events] form.created … [bridge] 表单 created 无绑定用户`，随后 `form.cancelled` 同样到达；
+  首版按平铺形状实现时日志为 `form.created 缺少 id/sessionID，未分发 dataKeys=form`，即由此发现包裹差异。
 - **端到端已验证（2026-10-06）**：真实 token 发送 6MB（6291456 字节）文件，收件人确认收到**单个**完整文件；
   日志 `upload_prepare 200 → PUT 6291456 bytes 200 → upload_part_finish 200 → /files(upload_id) 200 → messages 200`。
   实测平台返回 `block_size=10485760`（10MB）且 `parts[].index=1`，与文档所称「默认 5MB / 从 0 起」不符，

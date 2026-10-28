@@ -638,6 +638,7 @@ export function buildHelpText(): string {
     "/agent <name> - 切换 Agent",
     "/rename <name> - 重命名当前会话",
     "/cache - 查看当前会话 token/cache 统计",
+    "AI 出选择题时：直接回复序号作答（多题如 1 2），/cancel 放弃提问",
     "其他 /命令 - 透传给 opencode（如 /init /review）",
   ].join("\n")
 }
